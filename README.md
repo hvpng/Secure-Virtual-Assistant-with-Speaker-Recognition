@@ -86,6 +86,20 @@ Generated MP3 files are written to `backend/data/generated_audio/`. M2 creates
 unique names and removes partial failures; M4/M7 must define cleanup after a
 response has been served.
 
+### M3 Gemini intent routing
+
+M3 uses native Gemini function calling through `google-genai`. Set
+`GEMINI_API_KEY` locally in `.env`; `GEMINI_MODEL` defaults to
+`gemini-3.6-flash`. Gemini only selects one of five allowlisted intents and
+semantic arguments. Authentication requirements remain hardcoded in Python;
+M3 does not verify speakers, choose identity, or execute business actions.
+
+Run a live smoke test from `backend` (network and a valid API key required):
+
+```powershell
+python -m scripts.smoke_nlu "Tôi muốn reset mật khẩu."
+```
+
 Run backend checks from `backend`:
 
 ```powershell
