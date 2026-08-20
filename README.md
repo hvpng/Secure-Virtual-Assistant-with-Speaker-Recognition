@@ -46,6 +46,20 @@ Invoke-RestMethod http://localhost:8000/health
 
 It returns `{"status":"ok"}`. Development CORS explicitly allows `http://localhost:5173`.
 
+### M1 audio and speaker configuration
+
+Speaker input is normalized through the shared audio utility to a temporary,
+mono, 16 kHz, 16-bit PCM WAV. Browser `.webm` decoding requires `ffmpeg` on
+`PATH`. Callers must delete the returned temporary WAV in a `finally` block;
+the speaker service already follows this contract.
+
+M1 uses `SPEAKER_BACKEND=fake` for deterministic local development and unit
+tests. Set `SPEAKER_BACKEND=real` only after Module A replaces
+`backend/app/models/speaker_model.py` with the real artifact. There is no silent
+fallback from real to fake. The checked-in speaker and enrollment JSON configs
+contain development-only thresholds and must be replaced by Module A's
+validation-calibrated exports before M7/final mode.
+
 Run backend checks from `backend`:
 
 ```powershell
@@ -75,4 +89,3 @@ npm run build
 ## Module boundaries
 
 M0 contains no speaker inference, ASR/TTS, Gemini function calling, business database schema, enrollment flow, or voice chat implementation. Speaker artifacts are produced by Module A and integrated in later modules.
-

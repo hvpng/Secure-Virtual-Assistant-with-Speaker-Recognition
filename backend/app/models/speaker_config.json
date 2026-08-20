@@ -1,0 +1,8 @@
+{
+  "development_placeholder": true,
+  "todo": "DEVELOPMENT DEFAULT - REPLACE FROM MODULE A VALIDATION CALIBRATION BEFORE M7",
+  "sample_rate": 16000,
+  "embedding_dimension": 64,
+  "sv_threshold": 0.8,
+  "sid_threshold": 0.8
+}

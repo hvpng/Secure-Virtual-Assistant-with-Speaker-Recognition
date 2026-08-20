@@ -1,0 +1,10 @@
+{
+  "development_placeholder": true,
+  "todo": "DEVELOPMENT DEFAULT - REPLACE FROM MODULE A VALIDATION CALIBRATION BEFORE M7",
+  "min_duration": 1.0,
+  "max_duration": 10.0,
+  "min_speech_ratio": 0.2,
+  "min_snr_db": 3.0,
+  "max_clipping_ratio": 0.02,
+  "max_content_wer": 0.2
+}
