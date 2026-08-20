@@ -100,6 +100,32 @@ Run a live smoke test from `backend` (network and a valid API key required):
 python -m scripts.smoke_nlu "Tôi muốn reset mật khẩu."
 ```
 
+### M4 backend API and hard auth gating
+
+The backend initializes the SQLite schema and idempotently seeds four demo
+employees when FastAPI starts. By default the database is stored at
+`backend/data/employees.db`; set `DATABASE_URL` only when an alternate database
+is needed for development or tests. API documentation is available at
+<http://localhost:8000/docs>.
+
+M4 exposes these routes:
+
+- `POST /api/chat` — ASR, intent routing, Python-controlled SV/SID gating,
+  business execution, and a generated TTS reply.
+- `POST /api/enroll` — initial enrollment using the seven server-owned scripts.
+- `POST /api/employees/{employee_id}/reenroll` — atomic profile replacement.
+- `DELETE /api/employees/{employee_id}/voice-profile` — remove only the voice
+  profile while retaining the employee record.
+- `GET /api/employees` — demo-safe employee selector data.
+- `GET /api/enrollment-scripts` — the canonical enrollment prompts.
+- `GET /api/audio/{filename}` — generated MP3 replies restricted to
+  `backend/data/generated_audio/`.
+
+Local development and deterministic tests may use `SPEAKER_BACKEND=fake`.
+Final/demo mode must set `SPEAKER_BACKEND=real` and provide the calibrated
+Module A artifact and configs; the application never silently falls back to
+the fake backend.
+
 Run backend checks from `backend`:
 
 ```powershell

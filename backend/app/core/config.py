@@ -28,6 +28,7 @@ class Settings:
     asr_fallback_enabled: bool = _env_bool("ASR_FALLBACK_ENABLED", True)
     speaker_device: str = os.getenv("SPEAKER_DEVICE", "auto")
     speaker_backend: str = os.getenv("SPEAKER_BACKEND", "fake")
+    database_url: str = os.getenv("DATABASE_URL", "")
     app_mode: str = os.getenv("APP_MODE", "dev")
 
 
