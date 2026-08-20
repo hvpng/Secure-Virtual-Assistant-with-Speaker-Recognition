@@ -1,0 +1,2 @@
+"""Speaker artifact package placeholders."""
+
