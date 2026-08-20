@@ -60,6 +60,32 @@ fallback from real to fake. The checked-in speaker and enrollment JSON configs
 contain development-only thresholds and must be replaced by Module A's
 validation-calibrated exports before M7/final mode.
 
+### M2 Vietnamese ASR and TTS
+
+M2 uses `vinai/PhoWhisper-small` through HuggingFace `transformers` as primary
+ASR. `ASR_DEVICE=auto` chooses CUDA when PyTorch reports it available and CPU
+otherwise. The multilingual OpenAI Whisper `base` model is lazy-loaded only
+after a logged PhoWhisper failure and only when `ASR_FALLBACK_ENABLED=true`.
+The first real ASR run can download model files; deterministic unit tests mock
+all model loaders and require no network.
+
+Run a real WAV or browser WebM smoke test from `backend`:
+
+```powershell
+python -m scripts.smoke_asr C:\path\to\vietnamese-audio.wav
+python -m scripts.smoke_asr C:\path\to\browser-recording.webm
+```
+
+Optionally test live gTTS (network required):
+
+```powershell
+python -m scripts.smoke_asr --tts-text "Xin chào, đây là thử nghiệm."
+```
+
+Generated MP3 files are written to `backend/data/generated_audio/`. M2 creates
+unique names and removes partial failures; M4/M7 must define cleanup after a
+response has been served.
+
 Run backend checks from `backend`:
 
 ```powershell
