@@ -14,6 +14,11 @@ backend/data/*.db
 frontend/node_modules/
 frontend/dist/
 
+module_a/outputs/*
+!module_a/outputs/.gitkeep
+module_a/data/
+module_a/checkpoints/
+module_a/**/.ipynb_checkpoints/
+
 .DS_Store
 Thumbs.db
-

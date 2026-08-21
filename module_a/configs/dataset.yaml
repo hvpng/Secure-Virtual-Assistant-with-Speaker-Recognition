@@ -1,0 +1,30 @@
+dataset:
+  name: vietnam_celeb
+  root: null
+  audio_extensions:
+    - .wav
+    - .flac
+    - .mp3
+    - .m4a
+  # Engineering eligibility default for A1, not a calibrated research threshold.
+  min_utterances_per_speaker: 2
+  # Default assumption: the immediate parent directory is the speaker ID.
+  # Override with path_component or metadata_csv after inspecting the real layout.
+  speaker_id_source: parent_dir
+  speaker_id_path_component: null
+  speaker_metadata_csv: null
+  speaker_metadata_path_column: path
+  speaker_metadata_id_column: speaker_id
+
+split:
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  seed: 42
+
+audio:
+  target_sample_rate: 16000
+
+inspection:
+  max_files: null
+

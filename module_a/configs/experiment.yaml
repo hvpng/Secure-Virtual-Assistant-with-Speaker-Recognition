@@ -1,0 +1,12 @@
+experiment:
+  name: vietnam_celeb_speaker_recognition
+  current_milestone: A1
+
+output:
+  # Resolved relative to module_a/ unless overridden by CLI.
+  root: outputs
+
+runtime_contract:
+  load_model: 'load_model(model_dir, device="auto")'
+  extract_embedding: 'extract_embedding(model, audio_path)'
+
