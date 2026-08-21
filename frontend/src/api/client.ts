@@ -36,6 +36,20 @@ export type EnrollmentResponse = {
   failed_items: FailedEnrollmentItem[]
 }
 
+export type AuthType = 'SV' | 'SID' | null
+
+export type ChatResponse = {
+  success: boolean
+  text_asr: string
+  function_called: string | null
+  auth_type: AuthType
+  auth_passed: boolean | null
+  employee_id: string | null
+  speaker_score: number | null
+  response_text: string
+  audio_reply_url: string | null
+}
+
 export class ApiError extends Error {
   readonly status: number | null
 
@@ -220,4 +234,71 @@ export async function removeVoiceProfile(employeeId: string): Promise<void> {
   await requestJson(`/api/employees/${encodeURIComponent(employeeId)}/voice-profile`, {
     method: 'DELETE',
   })
+}
+
+export function buildVoiceCommandFormData(
+  audio: Blob,
+  claimedEmployeeId?: string,
+): FormData {
+  const formData = new FormData()
+  formData.append('audio', audio, 'voice-command.webm')
+  const normalizedClaim = claimedEmployeeId?.trim()
+  if (normalizedClaim) formData.append('claimed_employee_id', normalizedClaim)
+  return formData
+}
+
+function isChatResponse(body: unknown): body is ChatResponse {
+  if (typeof body !== 'object' || body === null) return false
+  const response = body as Record<string, unknown>
+  const nullableString = (value: unknown) => value === null || typeof value === 'string'
+  const nullableBoolean = (value: unknown) => value === null || typeof value === 'boolean'
+  const nullableFiniteNumber = (value: unknown) =>
+    value === null || (typeof value === 'number' && Number.isFinite(value))
+
+  return (
+    typeof response.success === 'boolean' &&
+    typeof response.text_asr === 'string' &&
+    nullableString(response.function_called) &&
+    (response.auth_type === null || response.auth_type === 'SV' || response.auth_type === 'SID') &&
+    nullableBoolean(response.auth_passed) &&
+    nullableString(response.employee_id) &&
+    nullableFiniteNumber(response.speaker_score) &&
+    typeof response.response_text === 'string' &&
+    nullableString(response.audio_reply_url)
+  )
+}
+
+export async function sendVoiceCommand(
+  audio: Blob,
+  claimedEmployeeId?: string,
+): Promise<ChatResponse> {
+  if (audio.size <= 0) throw new ApiError('Bản ghi âm không được rỗng.')
+
+  let response: Response
+  try {
+    response = await fetch(`${API_BASE_URL}/api/chat`, {
+      method: 'POST',
+      body: buildVoiceCommandFormData(audio, claimedEmployeeId),
+    })
+  } catch {
+    throw new ApiError('Không thể kết nối đến máy chủ.')
+  }
+
+  const body = await parseResponseBody(response)
+  if (!response.ok) throw new ApiError(errorMessage(body), response.status)
+  if (!isChatResponse(body)) {
+    throw new ApiError('Không thể xử lý yêu cầu. Vui lòng thử lại.', response.status)
+  }
+  return body
+}
+
+export function resolveApiUrl(path: string): string {
+  try {
+    const base = new URL(`${API_BASE_URL.replace(/\/+$/, '')}/`)
+    const resolved = new URL(path, base)
+    if (resolved.origin !== base.origin) throw new Error('Cross-origin audio URL')
+    return resolved.toString()
+  } catch {
+    throw new ApiError('Đường dẫn phản hồi âm thanh không hợp lệ.')
+  }
 }

@@ -10,6 +10,9 @@ type AudioRecorderProps = {
   onStarted: (index: number) => void
   onRecorded: (index: number, blob: Blob, mimeType: string) => void
   onError: (index: number, message: string) => void
+  startLabel?: string
+  stopLabel?: string
+  rerecordLabel?: string
 }
 
 export function AudioRecorder({
@@ -20,6 +23,9 @@ export function AudioRecorder({
   onStarted,
   onRecorded,
   onError,
+  startLabel = 'Bắt đầu ghi',
+  stopLabel = 'Dừng ghi',
+  rerecordLabel = 'Ghi lại',
 }: AudioRecorderProps) {
   const recorderRef = useRef<MediaRecorder | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
@@ -153,7 +159,7 @@ export function AudioRecorder({
         onClick={stopRecording}
         className="rounded-md bg-red-600 px-3 py-2 text-sm font-medium text-white hover:bg-red-700"
       >
-        Dừng ghi
+        {stopLabel}
       </button>
     )
   }
@@ -165,7 +171,7 @@ export function AudioRecorder({
       disabled={disabled}
       className="rounded-md bg-blue-700 px-3 py-2 text-sm font-medium text-white hover:bg-blue-800 disabled:cursor-not-allowed disabled:bg-slate-300"
     >
-      {hasRecording ? 'Ghi lại' : 'Bắt đầu ghi'}
+      {hasRecording ? rerecordLabel : startLabel}
     </button>
   )
 }

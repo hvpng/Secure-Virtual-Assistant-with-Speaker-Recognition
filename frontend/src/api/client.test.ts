@@ -2,11 +2,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   buildEnrollmentFormData,
+  buildVoiceCommandFormData,
   enrollEmployee,
   getEmployees,
   getEnrollmentScripts,
   reenrollEmployee,
   removeVoiceProfile,
+  resolveApiUrl,
+  sendVoiceCommand,
 } from './client'
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -140,6 +143,74 @@ describe('M5 API client', () => {
 
     await expect(getEmployees()).rejects.toThrow(
       'Không thể hoàn thành yêu cầu. Vui lòng thử lại.',
+    )
+  })
+
+  it('builds the voice command with only audio when no claim is selected', () => {
+    const formData = buildVoiceCommandFormData(
+      new Blob(['voice'], { type: 'audio/webm;codecs=opus' }),
+    )
+
+    expect([...formData.keys()]).toEqual(['audio'])
+    expect((formData.get('audio') as File).name).toBe('voice-command.webm')
+    expect(formData.get('claimed_employee_id')).toBeNull()
+  })
+
+  it('appends an optional trimmed claim without frontend intent or auth fields', () => {
+    const formData = buildVoiceCommandFormData(new Blob(['voice']), ' NV001 ')
+
+    expect([...formData.keys()]).toEqual(['audio', 'claimed_employee_id'])
+    expect(formData.get('claimed_employee_id')).toBe('NV001')
+    expect(formData.get('function_name')).toBeNull()
+    expect(formData.get('auth_type')).toBeNull()
+    expect(formData.get('auth_passed')).toBeNull()
+    expect(formData.get('employee_id')).toBeNull()
+    expect(formData.get('transcript')).toBeNull()
+  })
+
+  it('returns an HTTP 200 auth denial as a valid chat result', async () => {
+    const denial = {
+      success: false,
+      text_asr: 'Tôi muốn reset mật khẩu',
+      function_called: 'reset_password',
+      auth_type: 'SV',
+      auth_passed: false,
+      employee_id: null,
+      speaker_score: null,
+      response_text: 'Vui lòng cung cấp mã nhân viên.',
+      audio_reply_url: null,
+    }
+    vi.mocked(fetch).mockResolvedValue(jsonResponse(denial))
+
+    await expect(sendVoiceCommand(new Blob(['voice']))).resolves.toEqual(denial)
+    expect(vi.mocked(fetch).mock.calls[0][1]).not.toHaveProperty('headers')
+  })
+
+  it('rejects empty audio, HTTP errors, and malformed successful chat responses', async () => {
+    await expect(sendVoiceCommand(new Blob([]))).rejects.toThrow('Bản ghi âm không được rỗng.')
+
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(jsonResponse({ detail: 'File quá lớn.' }, 413))
+      .mockResolvedValueOnce(jsonResponse({ success: true }))
+      .mockResolvedValueOnce(new Response('<html>unavailable</html>', { status: 503 }))
+
+    await expect(sendVoiceCommand(new Blob(['voice']))).rejects.toEqual(
+      expect.objectContaining({ message: 'File quá lớn.', status: 413 }),
+    )
+    await expect(sendVoiceCommand(new Blob(['voice']))).rejects.toThrow(
+      'Không thể xử lý yêu cầu. Vui lòng thử lại.',
+    )
+    await expect(sendVoiceCommand(new Blob(['voice']))).rejects.toThrow(
+      'Không thể hoàn thành yêu cầu. Vui lòng thử lại.',
+    )
+  })
+
+  it('resolves backend TTS paths without allowing a different origin', () => {
+    expect(resolveApiUrl('/api/audio/reply.mp3')).toBe(
+      'http://127.0.0.1:8000/api/audio/reply.mp3',
+    )
+    expect(() => resolveApiUrl('https://attacker.example/reply.mp3')).toThrow(
+      'Đường dẫn phản hồi âm thanh không hợp lệ.',
     )
   })
 })
