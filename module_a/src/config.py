@@ -1,8 +1,8 @@
-"""Small, validated YAML configuration layer for Module A A0/A1."""
+"""Small, validated YAML configuration layer for Module A A0-A2."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +43,7 @@ class SplitConfig:
 @dataclass(frozen=True)
 class AudioConfig:
     target_sample_rate: int
+    segment_seconds: float
 
 
 @dataclass(frozen=True)
@@ -51,11 +52,45 @@ class InspectionConfig:
 
 
 @dataclass(frozen=True)
+class ModelConfig:
+    architecture: str
+    wavlm_model_name: str
+    wavlm_frozen: bool
+    stage2_enabled: bool
+    wavlm_hidden_dimension: int
+    adapter_dimension: int
+    embedding_dimension: int
+    campp_growth_rate: int
+    campp_block_layers: tuple[int, ...]
+    campp_init_channels: int
+    campp_bottleneck_channels: int
+    campp_fcm_channels: int
+    campp_segment_frames: int
+
+
+@dataclass(frozen=True)
+class LossConfig:
+    type: str
+    margin: float
+    scale: float
+
+
+@dataclass(frozen=True)
+class TrainingConfig:
+    mixed_precision: bool
+    learning_rate: float
+
+
+@dataclass(frozen=True)
 class ModuleAConfig:
+    seed: int
     dataset: DatasetConfig
     split: SplitConfig
     audio: AudioConfig
     inspection: InspectionConfig
+    model: ModelConfig
+    loss: LossConfig
+    training: TrainingConfig
     output_root: Path
 
     def with_overrides(
@@ -81,6 +116,21 @@ class ModuleAConfig:
         if not root.is_dir():
             raise ConfigurationError(f"Dataset root does not exist or is not a directory: {root}")
         return root
+
+
+def config_to_dict(config: ModuleAConfig) -> dict[str, Any]:
+    """Return a checkpoint-safe representation without notebook or YAML state."""
+
+    def convert(value: Any) -> Any:
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {key: convert(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [convert(item) for item in value]
+        return value
+
+    return convert(asdict(config))
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -118,6 +168,30 @@ def _ratio(value: Any, field: str) -> float:
     return float(value)
 
 
+def _positive_number(value: Any, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ConfigurationError(f"'{field}' must be a positive number.")
+    return float(value)
+
+
+def _boolean(value: Any, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigurationError(f"'{field}' must be true or false.")
+    return value
+
+
+def _non_empty_string(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigurationError(f"'{field}' must be a non-empty string.")
+    return value.strip()
+
+
+def _positive_int_tuple(value: Any, field: str) -> tuple[int, ...]:
+    if not isinstance(value, list) or not value:
+        raise ConfigurationError(f"'{field}' must be a non-empty integer list.")
+    return tuple(_positive_int(item, field) for item in value)
+
+
 def _optional_path(value: Any, base: Path) -> Path | None:
     if value is None:
         return None
@@ -134,7 +208,7 @@ def load_config(
     dataset_root: str | Path | None = None,
     output_root: str | Path | None = None,
 ) -> ModuleAConfig:
-    """Load A0/A1 configuration without requiring the dataset to exist locally."""
+    """Load A0-A2 configuration without requiring a dataset or model download."""
 
     dataset_path = Path(dataset_config_path).expanduser().resolve()
     experiment_path = Path(experiment_config_path).expanduser().resolve()
@@ -146,6 +220,10 @@ def load_config(
     audio_data = _mapping(dataset_document, "audio")
     inspection_data = _mapping(dataset_document, "inspection")
     output_data = _mapping(experiment_document, "output")
+    model_data = _mapping(experiment_document, "model")
+    model_audio_data = _mapping(experiment_document, "audio")
+    loss_data = _mapping(experiment_document, "loss")
+    training_data = _mapping(experiment_document, "training")
 
     name = dataset_data.get("name")
     if not isinstance(name, str) or not name.strip():
@@ -177,6 +255,35 @@ def load_config(
     test_ratio = _ratio(split_data.get("test_ratio"), "split.test_ratio")
     if abs(train_ratio + val_ratio + test_ratio - 1.0) > 1e-9:
         raise ConfigurationError("Split ratios must sum to exactly 1.0.")
+    seed = _integer(experiment_document.get("seed"), "seed")
+    split_seed = _integer(split_data.get("seed"), "split.seed")
+    if seed != split_seed:
+        raise ConfigurationError("Experiment seed and split.seed must match.")
+
+    dataset_sample_rate = _positive_int(
+        audio_data.get("target_sample_rate"), "audio.target_sample_rate"
+    )
+    model_sample_rate = _positive_int(
+        model_audio_data.get("sample_rate"), "experiment.audio.sample_rate"
+    )
+    if dataset_sample_rate != model_sample_rate:
+        raise ConfigurationError("Dataset and model sample rates must match.")
+
+    architecture = _non_empty_string(model_data.get("architecture"), "model.architecture")
+    if architecture != "wavlm_base_plus_campp":
+        raise ConfigurationError("A2 model.architecture must be wavlm_base_plus_campp.")
+    wavlm_frozen = _boolean(model_data.get("wavlm_frozen"), "model.wavlm_frozen")
+    stage2_enabled = _boolean(model_data.get("stage2_enabled"), "model.stage2_enabled")
+    if not wavlm_frozen or stage2_enabled:
+        raise ConfigurationError("A2 requires frozen WavLM and stage2_enabled=false.")
+    adapter_dimension = _positive_int(
+        model_data.get("adapter_dimension"), "model.adapter_dimension"
+    )
+    if adapter_dimension != 80:
+        raise ConfigurationError("Canonical A2 adapter_dimension must be 80.")
+    loss_type = _non_empty_string(loss_data.get("type"), "loss.type")
+    if loss_type != "aam_softmax":
+        raise ConfigurationError("A2 loss.type must be aam_softmax.")
 
     max_files = inspection_data.get("max_files")
     if max_files is not None:
@@ -192,6 +299,7 @@ def load_config(
         output_path = (MODULE_A_ROOT / output_path).resolve()
 
     config = ModuleAConfig(
+        seed=seed,
         dataset=DatasetConfig(
             name=name.strip(),
             root=configured_dataset_root,
@@ -214,14 +322,64 @@ def load_config(
             train_ratio=train_ratio,
             val_ratio=val_ratio,
             test_ratio=test_ratio,
-            seed=_integer(split_data.get("seed"), "split.seed"),
+            seed=split_seed,
         ),
         audio=AudioConfig(
-            target_sample_rate=_positive_int(
-                audio_data.get("target_sample_rate"), "audio.target_sample_rate"
-            )
+            target_sample_rate=dataset_sample_rate,
+            segment_seconds=_positive_number(
+                model_audio_data.get("segment_seconds"),
+                "experiment.audio.segment_seconds",
+            ),
         ),
         inspection=InspectionConfig(max_files=max_files),
+        model=ModelConfig(
+            architecture=architecture,
+            wavlm_model_name=_non_empty_string(
+                model_data.get("wavlm_model_name"), "model.wavlm_model_name"
+            ),
+            wavlm_frozen=wavlm_frozen,
+            stage2_enabled=stage2_enabled,
+            wavlm_hidden_dimension=_positive_int(
+                model_data.get("wavlm_hidden_dimension"),
+                "model.wavlm_hidden_dimension",
+            ),
+            adapter_dimension=adapter_dimension,
+            embedding_dimension=_positive_int(
+                model_data.get("embedding_dimension"), "model.embedding_dimension"
+            ),
+            campp_growth_rate=_positive_int(
+                model_data.get("campp_growth_rate"), "model.campp_growth_rate"
+            ),
+            campp_block_layers=_positive_int_tuple(
+                model_data.get("campp_block_layers"), "model.campp_block_layers"
+            ),
+            campp_init_channels=_positive_int(
+                model_data.get("campp_init_channels"), "model.campp_init_channels"
+            ),
+            campp_bottleneck_channels=_positive_int(
+                model_data.get("campp_bottleneck_channels"),
+                "model.campp_bottleneck_channels",
+            ),
+            campp_fcm_channels=_positive_int(
+                model_data.get("campp_fcm_channels"), "model.campp_fcm_channels"
+            ),
+            campp_segment_frames=_positive_int(
+                model_data.get("campp_segment_frames"), "model.campp_segment_frames"
+            ),
+        ),
+        loss=LossConfig(
+            type=loss_type,
+            margin=_positive_number(loss_data.get("margin"), "loss.margin"),
+            scale=_positive_number(loss_data.get("scale"), "loss.scale"),
+        ),
+        training=TrainingConfig(
+            mixed_precision=_boolean(
+                training_data.get("mixed_precision"), "training.mixed_precision"
+            ),
+            learning_rate=_positive_number(
+                training_data.get("learning_rate"), "training.learning_rate"
+            ),
+        ),
         output_root=output_path,
     )
     return config.with_overrides(dataset_root=dataset_root, output_root=output_root)

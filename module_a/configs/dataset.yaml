@@ -7,7 +7,7 @@ dataset:
     - .mp3
     - .m4a
   # Engineering eligibility default for A1, not a calibrated research threshold.
-  min_utterances_per_speaker: 2
+  min_utterances_per_speaker: 5
   # Default assumption: the immediate parent directory is the speaker ID.
   # Override with path_component or metadata_csv after inspecting the real layout.
   speaker_id_source: parent_dir

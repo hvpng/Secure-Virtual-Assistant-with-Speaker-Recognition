@@ -182,11 +182,23 @@ def test_pipeline_summary_counts_and_manifests_are_reproducible(tmp_path, write_
     first_output = tmp_path / "first"
     second_output = tmp_path / "second"
 
+    # This fixture intentionally creates two utterances per speaker. Keep its
+    # eligibility contract local so changes to the real-dataset engineering
+    # default do not turn every synthetic speaker into an excluded speaker.
+    base_config = load_config(dataset_root=dataset_root)
+    fixture_config = replace(
+        base_config,
+        dataset=replace(
+            base_config.dataset,
+            min_utterances_per_speaker=2,
+        ),
+    )
+
     first = prepare_manifests(
-        load_config(dataset_root=dataset_root, output_root=first_output)
+        fixture_config.with_overrides(output_root=first_output)
     )
     second = prepare_manifests(
-        load_config(dataset_root=dataset_root, output_root=second_output)
+        fixture_config.with_overrides(output_root=second_output)
     )
 
     assert first.inspection.summary["total_discovered_files"] == 21

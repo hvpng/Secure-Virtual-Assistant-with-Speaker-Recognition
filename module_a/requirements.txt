@@ -1,4 +1,6 @@
 numpy
 PyYAML
 pytest
-
+torch
+torchaudio
+transformers

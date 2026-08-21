@@ -2,13 +2,14 @@
 
 Module A runs separately from the FastAPI/React application. It prepares, trains,
 evaluates, calibrates, and eventually exports the speaker model consumed by Track B.
-The current implementation stops at A1 and contains no model loading or training code.
+The current implementation stops at A2. It contains architecture and optimizer sanity
+code, but no dataset training loop or model-performance evaluation.
 
 ## Milestones
 
 - A0: structure, lightweight configuration, reproducibility, and stable contracts — implemented.
 - A1: dataset discovery, audio metadata, eligibility filtering, speaker-disjoint manifests — implemented.
-- A2: model forward/backward sanity — not implemented.
+- A2: WavLM/CAM++/AAM forward, backward, optimizer, and checkpoint sanity — implemented.
 - A3: training and checkpointing — not implemented.
 - A4: SV/SID evaluation and validation-only calibration — not implemented.
 - A5: export and local Track B ABI smoke — not implemented.
@@ -24,8 +25,80 @@ python -m venv .venv-module-a
 ```
 
 On Linux/Kaggle use `.venv-module-a/bin/python` if creating a virtual environment.
-Kaggle images usually already include NumPy, PyYAML, pytest, and ffmpeg; no model is
-downloaded by A0/A1.
+Kaggle images usually already include PyTorch and ffmpeg. A0/A1 and default tests do
+not download a model. Only the explicit real A2 smoke command may download WavLM.
+
+## A2 architecture sanity
+
+The frozen Stage-1 graph is:
+
+```text
+float32 waveform [B, samples] at 16 kHz
+  -> microsoft/wavlm-base-plus final hidden state [B, frames, 768]
+  -> LayerNorm(768)
+  -> team engineering adapter Linear(768, 80) [B, frames, 80]
+  -> explicit transpose [B, 80, frames]
+  -> CAM++
+  -> raw speaker embedding [B, 192]
+  -> AAM-Softmax head during training
+```
+
+Inference uses L2-normalized embeddings. AAM-Softmax normalizes embeddings and class
+weights internally, then applies margin `0.2` and scale `30.0`. `num_classes` is a
+factory argument; A2 only uses synthetic labels. A3 must derive its mapping from train
+speakers only.
+
+All WavLM parameters are frozen and the frontend remains in eval mode even while the
+trainable adapter/CAM++/AAM path is in training mode. `stage2_enabled` is present only
+as an explicit future gate and must remain false in A2.
+
+Waveform collation uses deterministic center cropping and repeat-padding to the
+configured 3-second segment. Repeat-padding ensures CAM++ statistics pooling does not
+silently include zero padding. PCM16 WAV loading is implemented without an optional
+torchaudio decoder backend; other formats use torchaudio when its runtime backend is
+available.
+
+### CAM++ source and adaptation status
+
+The implementation is a local, non-verbatim reimplementation informed by:
+
+- Wang et al., [CAM++: A Fast and Efficient Network for Speaker Verification Using
+  Context-Aware Masking](https://arxiv.org/abs/2303.00332), Interspeech 2023.
+- The Apache-2.0 [ModelScope/3D-Speaker CAM++
+  implementation](https://github.com/modelscope/3D-Speaker/tree/main/speakerlab/models/campplus).
+
+It retains the paper's frequency convolution module, densely connected TDNN backbone,
+per-layer context-aware masks, global plus fixed-segment context, transition layers,
+and statistics pooling. The integration differs from the original Fbank recipe because
+the team's explicit WavLM adapter supplies 80-D frame features. The implementation is
+not claimed to be an official CAM++ release or an exact reproduction of published
+performance.
+
+Production-size config uses CAM++ block depths `12/24/16`, growth rate 32, and a 192-D
+embedding. Offline tests and `sanity_model` inject a smaller topology while preserving
+all tensor contracts so CPU tests stay fast. The real smoke uses production-size config.
+
+### A2 commands
+
+```bash
+pytest module_a/tests -q
+python -m module_a.scripts.sanity_model
+python -m module_a.scripts.smoke_model --help
+python -m module_a.scripts.smoke_model --device auto
+```
+
+`sanity_model` injects a deterministic fake WavLM and never downloads weights. It runs
+one forward/backward/optimizer step and a temporary checkpoint roundtrip. `smoke_model`
+is the separate real Hugging Face integration check; it defaults to one short waveform,
+batch size one, frozen WavLM, and no optimizer.
+
+The atomic checkpoint contract stores `model_state_dict`, `optimizer_state_dict`,
+`epoch`, `step`, the full serialized config, `num_classes`, and the train-speaker-only
+`speaker_to_index` mapping. It stores model tensors, not a Hugging Face cache directory.
+
+A2 proves model-graph correctness only. Full Vietnam-Celeb training belongs to A3;
+EER, SID evaluation, and all thresholds belong to A4; production Track B export belongs
+to A5.
 
 ## Configuration
 
@@ -118,7 +191,7 @@ extract_embedding(model, audio_path)
 ```
 
 The final embedding will be a finite, fixed-dimension, L2-normalized 1-D `np.float32`
-array. A0/A1 does not modify `backend/app/models/speaker_model.py`.
+array. A0-A2 does not modify `backend/app/models/speaker_model.py`.
 
 Future exported fields remain `embedding_dimension`, `sv_threshold`, and
 `sid_threshold`. Enrollment-quality fields remain `min_duration`, `max_duration`,

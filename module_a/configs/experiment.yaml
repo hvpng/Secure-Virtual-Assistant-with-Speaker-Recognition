@@ -1,6 +1,39 @@
 experiment:
   name: vietnam_celeb_speaker_recognition
-  current_milestone: A1
+  current_milestone: A2
+
+seed: 42
+
+model:
+  architecture: wavlm_base_plus_campp
+  wavlm_model_name: microsoft/wavlm-base-plus
+  wavlm_frozen: true
+  # Stage 2 is a future option only; A2 always keeps WavLM frozen.
+  stage2_enabled: false
+  wavlm_hidden_dimension: 768
+  adapter_dimension: 80
+  embedding_dimension: 192
+  # CAM++ paper/3D-Speaker engineering defaults; tests inject a smaller topology.
+  campp_growth_rate: 32
+  campp_block_layers: [12, 24, 16]
+  campp_init_channels: 128
+  campp_bottleneck_channels: 128
+  campp_fcm_channels: 32
+  campp_segment_frames: 100
+
+audio:
+  sample_rate: 16000
+  segment_seconds: 3.0
+
+loss:
+  type: aam_softmax
+  margin: 0.2
+  scale: 30.0
+
+training:
+  mixed_precision: true
+  # Engineering starting point only; A3 must validate/tune on train/validation data.
+  learning_rate: 0.001
 
 output:
   # Resolved relative to module_a/ unless overridden by CLI.
@@ -9,4 +42,3 @@ output:
 runtime_contract:
   load_model: 'load_model(model_dir, device="auto")'
   extract_embedding: 'extract_embedding(model, audio_path)'
-
