@@ -75,6 +75,15 @@ the team's explicit WavLM adapter supplies 80-D frame features. The implementati
 not claimed to be an official CAM++ release or an exact reproduction of published
 performance.
 
+Within each dense layer, the second `BatchNorm1d -> ReLU` output is the shared input
+to both the local TDNN convolution and the context-aware mask, matching the referenced
+CAM++ data flow. Checkpoints trained before this correction fed the unnormalized
+bottleneck tensor to the sigmoid mask; this could create near-constant dense growth
+channels and degenerate downstream bottleneck running variances. Such checkpoints
+must not be used for A4 calibration/export and require retraining from initialization.
+`python -m module_a.scripts.diagnose_campp_checkpoint --help` documents the read-only
+BN-state and known-utterance diagnostic command.
+
 Production-size config uses CAM++ block depths `12/24/16`, growth rate 32, and a 192-D
 embedding. Offline tests and `sanity_model` inject a smaller topology while preserving
 all tensor contracts so CPU tests stay fast. The real smoke uses production-size config.

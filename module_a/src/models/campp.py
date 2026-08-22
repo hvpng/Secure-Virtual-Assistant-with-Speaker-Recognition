@@ -136,8 +136,13 @@ class CAMDenseLayer(nn.Module):
 
     def forward(self, inputs: Tensor) -> Tensor:
         bottleneck = self.bottleneck(inputs)
-        local_features = self.tdnn(bottleneck)
-        masked = local_features * self.mask(bottleneck)
+        # CAM++ applies the second BN/ReLU before both the local TDNN and CAM
+        # context branches. Feeding raw bottleneck output to the sigmoid mask can
+        # saturate it, creating near-constant dense growth channels whose running
+        # variances then collapse in every later pre-activation bottleneck BN.
+        normalized_bottleneck = self.tdnn[1](self.tdnn[0](bottleneck))
+        local_features = self.tdnn[2](normalized_bottleneck)
+        masked = local_features * self.mask(normalized_bottleneck)
         return torch.cat((inputs, masked), dim=1)
 
 
@@ -174,9 +179,53 @@ class CAMDenseBlock(nn.Module):
 
 class StatisticsPooling(nn.Module):
     def forward(self, inputs: Tensor) -> Tensor:
+        if inputs.ndim != 3 or not torch.isfinite(inputs).all():
+            raise CAMPlusPlusError(
+                "StatisticsPooling requires finite [batch, channels, frames] input."
+            )
         mean = inputs.mean(dim=-1)
         variance = inputs.var(dim=-1, unbiased=False).clamp_min(1e-5)
-        return torch.cat((mean, variance.sqrt()), dim=1)
+        pooled = torch.cat((mean, variance.sqrt()), dim=1)
+        if not torch.isfinite(pooled).all():
+            raise CAMPlusPlusError(
+                "StatisticsPooling overflowed on large finite activations."
+            )
+        return pooled
+
+
+def batch_norm_running_statistics(model: nn.Module) -> list[dict[str, float | int | str | bool]]:
+    """Return compact diagnostics without modifying BatchNorm state."""
+
+    statistics: list[dict[str, float | int | str | bool]] = []
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.BatchNorm1d):
+            continue
+        running_mean = module.running_mean
+        running_var = module.running_var
+        finite = bool(
+            running_mean is not None
+            and running_var is not None
+            and torch.isfinite(running_mean).all()
+            and torch.isfinite(running_var).all()
+        )
+        statistics.append(
+            {
+                "name": name,
+                "num_features": module.num_features,
+                "eps": float(module.eps),
+                "finite": finite,
+                "running_mean_abs_max": (
+                    float(running_mean.abs().max()) if running_mean is not None else float("nan")
+                ),
+                "running_var_min": (
+                    float(running_var.min()) if running_var is not None else float("nan")
+                ),
+                "running_var_max": (
+                    float(running_var.max()) if running_var is not None else float("nan")
+                ),
+            }
+        )
+    return statistics
 
 
 class CAMPlusPlus(nn.Module):

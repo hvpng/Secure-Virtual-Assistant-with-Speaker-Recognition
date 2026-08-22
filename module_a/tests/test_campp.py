@@ -4,9 +4,11 @@ import pytest
 import torch
 
 from module_a.src.models.campp import (
+    CAMDenseLayer,
     CAMPlusPlus,
     CAMPlusPlusError,
     StatisticsPooling,
+    batch_norm_running_statistics,
 )
 
 
@@ -62,6 +64,68 @@ def test_campp_normal_length_backward_reaches_dense_layers():
     )
 
 
+def test_campp_batch_norm_modules_and_running_stats_are_not_shared():
+    model = small_campp()
+    batch_norms = [
+        module for module in model.modules() if isinstance(module, torch.nn.BatchNorm1d)
+    ]
+
+    assert len(batch_norms) > 1
+    assert len({id(module) for module in batch_norms}) == len(batch_norms)
+    assert len({module.running_mean.untyped_storage().data_ptr() for module in batch_norms}) == len(
+        batch_norms
+    )
+    assert len({module.running_var.untyped_storage().data_ptr() for module in batch_norms}) == len(
+        batch_norms
+    )
+
+
+def test_cam_dense_mask_and_local_tdnn_share_normalized_bottleneck_input():
+    layer = CAMDenseLayer(
+        in_channels=8,
+        growth_rate=4,
+        bottleneck_channels=8,
+        dilation=1,
+        segment_frames=4,
+    ).train()
+    captured = {}
+
+    def capture_normalized(_module, _inputs, output):
+        captured["normalized"] = output.detach().clone()
+
+    def capture_mask_input(_module, inputs):
+        captured["mask_input"] = inputs[0].detach().clone()
+
+    normalized_hook = layer.tdnn[1].register_forward_hook(capture_normalized)
+    mask_hook = layer.mask.register_forward_pre_hook(capture_mask_input)
+    try:
+        output = layer(torch.randn(4, 8, 12))
+    finally:
+        normalized_hook.remove()
+        mask_hook.remove()
+
+    assert output.shape == (4, 12, 12)
+    assert torch.equal(captured["normalized"], captured["mask_input"])
+
+
+def test_campp_training_updates_bn_stats_without_systematic_variance_collapse():
+    torch.manual_seed(42)
+    model = small_campp().train()
+    for _ in range(40):
+        model(torch.randn(8, 80, 24))
+
+    diagnostics = batch_norm_running_statistics(model)
+    bottleneck = [item for item in diagnostics if ".bottleneck.0" in str(item["name"])]
+    assert bottleneck
+    assert all(item["finite"] for item in diagnostics)
+    assert min(float(item["running_var_min"]) for item in bottleneck) > 1e-3
+
+    model.eval()
+    with torch.no_grad():
+        embedding = model(torch.randn(2, 80, 24))
+    assert torch.isfinite(embedding).all()
+
+
 def test_statistics_pooling_zero_variance_std_and_backward_are_finite():
     pooling = StatisticsPooling()
     inputs = torch.ones(2, 3, 4, requires_grad=True)
@@ -73,3 +137,14 @@ def test_statistics_pooling_zero_variance_std_and_backward_are_finite():
     assert torch.allclose(output[:, 3:], expected_std)
     assert inputs.grad is not None
     assert torch.isfinite(inputs.grad).all()
+
+
+def test_statistics_pooling_large_finite_input_is_stable_or_fails_clearly():
+    pooling = StatisticsPooling()
+    stable = torch.tensor([1e18, -1e18], dtype=torch.float32).repeat(2, 3, 4)
+    output = pooling(stable)
+    assert torch.isfinite(output).all()
+
+    overflowing = torch.tensor([1e20, -1e20], dtype=torch.float32).repeat(2, 3, 4)
+    with pytest.raises(CAMPlusPlusError, match="overflowed"):
+        pooling(overflowing)
