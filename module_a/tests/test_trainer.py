@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
 import subprocess
 import sys
@@ -10,11 +11,94 @@ from pathlib import Path
 import pytest
 import torch
 
+from module_a.src import trainer as trainer_module
 from module_a.src.checkpoint import CheckpointError, load_checkpoint
 from module_a.src.config import ConfigurationError, load_config
 from module_a.src.model_factory import build_model, build_optimizer, build_scheduler
 from module_a.src.models.wavlm_frontend import DeterministicFakeWavLM
-from module_a.src.trainer import create_grad_scaler, prepare_training_data, train_model
+from module_a.src.trainer import (
+    TrainerError,
+    create_grad_scaler,
+    prepare_training_data,
+    train_model,
+)
+
+
+class FakeGradScaler:
+    """CPU test double with GradScaler-compatible overflow semantics."""
+
+    def __init__(self, overflows: list[bool], *, initial_scale: float = 8.0):
+        self.overflows = list(overflows)
+        self.current_scale = initial_scale
+        self.current_overflow = False
+        self.scale_calls = 0
+        self.unscale_calls = 0
+        self.step_calls = 0
+        self.update_calls = 0
+        self.optimizer_step_calls = 0
+
+    def is_enabled(self):
+        return True
+
+    def scale(self, loss):
+        self.scale_calls += 1
+        return loss
+
+    def unscale_(self, optimizer):
+        del optimizer
+        self.unscale_calls += 1
+
+    def get_scale(self):
+        return self.current_scale
+
+    def step(self, optimizer):
+        self.step_calls += 1
+        self.current_overflow = self.overflows.pop(0) if self.overflows else False
+        if not self.current_overflow:
+            optimizer.step()
+            self.optimizer_step_calls += 1
+
+    def update(self):
+        self.update_calls += 1
+        if self.current_overflow:
+            self.current_scale *= 0.5
+
+    def state_dict(self):
+        return {"scale": self.current_scale}
+
+    def load_state_dict(self, state):
+        self.current_scale = float(state["scale"])
+
+
+class CountingScheduler:
+    def __init__(self):
+        self.step_calls = 0
+
+    def step(self):
+        self.step_calls += 1
+
+    def state_dict(self):
+        return {"step_calls": self.step_calls}
+
+    def load_state_dict(self, state):
+        self.step_calls = int(state["step_calls"])
+
+
+def _history_events(path: Path) -> list[dict[str, object]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def _install_fake_amp(monkeypatch, scaler, scheduler):
+    monkeypatch.setattr(
+        trainer_module,
+        "create_grad_scaler",
+        lambda _device, _enabled: scaler,
+    )
+    monkeypatch.setattr(
+        trainer_module,
+        "build_scheduler",
+        lambda *_args, **_kwargs: scheduler,
+    )
 
 
 def build_training_fixture(tmp_path, write_wav, small_model_config, *, max_steps=2):
@@ -115,6 +199,127 @@ def test_cpu_one_step_changes_backend_not_frozen_frontend_and_writes_outputs(
     assert Path(result.checkpoint_path).is_file()
 
 
+def test_fp32_non_finite_gradient_remains_fatal(
+    tmp_path, write_wav, small_model_config
+):
+    config, data = build_training_fixture(
+        tmp_path, write_wav, small_model_config, max_steps=1
+    )
+    config = replace(
+        config,
+        training=replace(config.training, mixed_precision=False),
+    )
+    model = new_model(config, len(data.speaker_to_index))
+    model.encoder.layer_norm.weight.register_hook(
+        lambda gradient: torch.full_like(gradient, float("inf"))
+    )
+
+    with pytest.raises(
+        TrainerError, match=r"Non-finite gradient.*encoder\.layer_norm\.weight"
+    ):
+        train_model(
+            model=model,
+            config=config,
+            data=data,
+            device=torch.device("cpu"),
+            output_dir=tmp_path / "run",
+        )
+
+
+def test_amp_overflow_skips_update_and_scheduler_then_recovers(
+    tmp_path, write_wav, small_model_config, monkeypatch
+):
+    config, data = build_training_fixture(
+        tmp_path, write_wav, small_model_config, max_steps=1
+    )
+    model = new_model(config, len(data.speaker_to_index))
+    scaler = FakeGradScaler([True, False], initial_scale=8.0)
+    scheduler = CountingScheduler()
+    _install_fake_amp(monkeypatch, scaler, scheduler)
+
+    result = train_model(
+        model=model,
+        config=config,
+        data=data,
+        device=torch.device("cpu"),
+        output_dir=tmp_path / "run",
+    )
+
+    events = _history_events(tmp_path / "run" / "history.jsonl")
+    overflow = next(event for event in events if event["type"] == "amp_overflow")
+    assert overflow["step"] == 0
+    assert overflow["pending_step"] == 1
+    assert overflow["old_scale"] == 8.0
+    assert overflow["new_scale"] == 4.0
+    assert result.global_step == 1
+    assert scaler.step_calls == 2
+    assert scaler.optimizer_step_calls == 1
+    assert scheduler.step_calls == 1
+    assert any(event["type"] == "train" and event["step"] == 1 for event in events)
+
+
+def test_amp_gradient_accumulation_updates_only_at_boundary(
+    tmp_path, write_wav, small_model_config, monkeypatch
+):
+    config, data = build_training_fixture(
+        tmp_path, write_wav, small_model_config, max_steps=1
+    )
+    config = replace(
+        config,
+        training=replace(config.training, gradient_accumulation_steps=2),
+    )
+    scaler = FakeGradScaler([False])
+    scheduler = CountingScheduler()
+    _install_fake_amp(monkeypatch, scaler, scheduler)
+
+    result = train_model(
+        model=new_model(config, len(data.speaker_to_index)),
+        config=config,
+        data=data,
+        device=torch.device("cpu"),
+        output_dir=tmp_path / "run",
+    )
+
+    assert result.global_step == 1
+    assert scaler.scale_calls == 2
+    assert scaler.unscale_calls == 1
+    assert scaler.step_calls == 1
+    assert scaler.update_calls == 1
+    assert scaler.optimizer_step_calls == 1
+    assert scheduler.step_calls == 1
+
+
+def test_excessive_consecutive_amp_overflows_fail_controlled(
+    tmp_path, write_wav, small_model_config, monkeypatch
+):
+    config, data = build_training_fixture(
+        tmp_path, write_wav, small_model_config, max_steps=1
+    )
+    config = replace(
+        config,
+        training=replace(config.training, max_consecutive_amp_overflows=2),
+    )
+    scaler = FakeGradScaler([True, True], initial_scale=8.0)
+    scheduler = CountingScheduler()
+    _install_fake_amp(monkeypatch, scaler, scheduler)
+
+    with pytest.raises(TrainerError, match="2 consecutive skipped updates.*scale 2.0"):
+        train_model(
+            model=new_model(config, len(data.speaker_to_index)),
+            config=config,
+            data=data,
+            device=torch.device("cpu"),
+            output_dir=tmp_path / "run",
+        )
+
+    events = _history_events(tmp_path / "run" / "history.jsonl")
+    overflows = [event for event in events if event["type"] == "amp_overflow"]
+    assert len(overflows) == 2
+    assert [event["step"] for event in overflows] == [0, 0]
+    assert scaler.optimizer_step_calls == 0
+    assert scheduler.step_calls == 0
+
+
 def test_resume_restores_step_optimizer_scheduler_and_rejects_mapping_mismatch(
     tmp_path, write_wav, small_model_config
 ):
@@ -174,6 +379,7 @@ def test_resume_restores_step_optimizer_scheduler_and_rejects_mapping_mismatch(
         ("max_steps", "0"),
         ("speakers_per_batch", "0"),
         ("utterances_per_speaker", "0"),
+        ("max_consecutive_amp_overflows", "0"),
     ],
 )
 def test_a3_config_rejects_non_positive_training_values(tmp_path, field, bad_value):

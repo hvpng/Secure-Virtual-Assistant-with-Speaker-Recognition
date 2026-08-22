@@ -92,6 +92,7 @@ class TrainingConfig:
     max_train_speakers: int | None
     max_monitor_speakers: int | None
     monitor_holdout_ratio: float
+    max_consecutive_amp_overflows: int
 
 
 @dataclass(frozen=True)
@@ -465,6 +466,10 @@ def load_config(
             monitor_holdout_ratio=_ratio(
                 training_data.get("monitor_holdout_ratio"),
                 "training.monitor_holdout_ratio",
+            ),
+            max_consecutive_amp_overflows=_positive_int(
+                training_data.get("max_consecutive_amp_overflows", 20),
+                "training.max_consecutive_amp_overflows",
             ),
         ),
         scheduler=SchedulerConfig(

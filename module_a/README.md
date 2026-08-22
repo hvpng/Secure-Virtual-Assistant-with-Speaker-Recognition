@@ -129,7 +129,10 @@ dominate merely because they have more files.
 The Stage-1 optimizer remains AdamW over trainable adapter/CAM++/AAM parameters only;
 WavLM is frozen and excluded. The scheduler is per-update warmup plus cosine decay.
 CUDA uses `torch.autocast` and `torch.amp.GradScaler` when `mixed_precision: true`;
-CPU disables AMP safely. Non-finite losses or gradients abort the run.
+CPU disables AMP safely. A finite-loss CUDA FP16 gradient overflow is skipped by
+GradScaler, logged as `amp_overflow`, and retried at a lower scale without advancing
+the scheduler or global optimizer step. Twenty consecutive overflows abort the run.
+Non-finite forward losses remain fatal; FP32 non-finite gradients also remain fatal.
 
 The real-data CLI refuses to train unless `--mini` or an explicit `--max-steps` is
 provided. A Kaggle 50-speaker/50-step smoke command is:

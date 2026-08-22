@@ -49,6 +49,8 @@ training:
   max_train_speakers: null
   max_monitor_speakers: null
   monitor_holdout_ratio: 0.1
+  # Abort instead of retrying forever if lowering the AMP scale never recovers.
+  max_consecutive_amp_overflows: 20
 
 scheduler:
   type: cosine

@@ -14,6 +14,8 @@ from typing import Any, Mapping
 
 import torch
 from torch import Tensor, nn
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader
 
 from module_a.src.checkpoint import load_checkpoint, save_checkpoint
@@ -68,6 +70,13 @@ class TrainingResult:
     elapsed_seconds: float
     checkpoint_path: str
     resumed_from: str | None
+
+
+@dataclass(frozen=True)
+class OptimizerUpdateResult:
+    succeeded: bool
+    old_scale: float | None
+    new_scale: float | None
 
 
 def create_grad_scaler(device: torch.device, enabled: bool) -> torch.amp.GradScaler:
@@ -330,6 +339,46 @@ def _assert_finite_gradients(model: nn.Module) -> None:
             raise TrainerError(f"Non-finite gradient detected in: {name}")
 
 
+def _apply_optimizer_update(
+    *,
+    model: nn.Module,
+    optimizer: Optimizer,
+    scheduler: LRScheduler,
+    scaler: Any,
+    amp_enabled: bool,
+) -> OptimizerUpdateResult:
+    """Apply one update, allowing GradScaler to recover from AMP overflow.
+
+    With AMP, ``unscale_`` records non-finite gradients for ``step``. GradScaler
+    then skips ``optimizer.step`` and ``update`` reduces its scale. Optimizer
+    return values cannot identify a skip (AdamW normally returns ``None``), so a
+    strict scale decrease is the PyTorch-supported overflow signal. The scheduler
+    advances only when the optimizer update actually succeeds.
+    """
+
+    if amp_enabled:
+        scaler.unscale_(optimizer)
+        old_scale = float(scaler.get_scale())
+        scaler.step(optimizer)
+        scaler.update()
+        new_scale = float(scaler.get_scale())
+        optimizer.zero_grad(set_to_none=True)
+        succeeded = new_scale >= old_scale
+        if succeeded:
+            scheduler.step()
+        return OptimizerUpdateResult(
+            succeeded=succeeded,
+            old_scale=old_scale,
+            new_scale=new_scale,
+        )
+
+    _assert_finite_gradients(model)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    scheduler.step()
+    return OptimizerUpdateResult(succeeded=True, old_scale=None, new_scale=None)
+
+
 def _checkpoint_metadata(
     *,
     next_epoch: int,
@@ -338,6 +387,7 @@ def _checkpoint_metadata(
     final_train_loss: float,
     selected_speakers: tuple[str, ...],
     resume_signature: Mapping[str, Any],
+    consecutive_amp_overflows: int,
 ) -> dict[str, Any]:
     return {
         "next_epoch": next_epoch,
@@ -346,6 +396,7 @@ def _checkpoint_metadata(
         "final_train_loss": final_train_loss,
         "selected_speakers": list(selected_speakers),
         "resume_signature": dict(resume_signature),
+        "consecutive_amp_overflows": consecutive_amp_overflows,
     }
 
 
@@ -443,6 +494,7 @@ def train_model(
     start_batch = 0
     global_step = 0
     best_monitor_loss = math.inf
+    consecutive_amp_overflows = 0
     resumed_from: str | None = None
     if resume is not None:
         payload = load_checkpoint(
@@ -462,6 +514,11 @@ def train_model(
         start_batch = int(metadata.get("next_batch", 0))
         global_step = int(payload["step"])
         best_monitor_loss = float(metadata.get("best_monitor_loss", math.inf))
+        consecutive_amp_overflows = int(
+            metadata.get("consecutive_amp_overflows", 0)
+        )
+        if consecutive_amp_overflows < 0:
+            raise TrainerError("Checkpoint AMP overflow count is invalid.")
         resumed_train_loss = float(metadata.get("final_train_loss", math.nan))
         if metadata.get("selected_speakers") not in (
             None,
@@ -497,6 +554,7 @@ def train_model(
     next_batch = start_batch
     stopped = global_step >= invocation_stop_step
     optimizer.zero_grad(set_to_none=True)
+    amp_enabled = bool(scaler.is_enabled())
 
     for epoch in range(start_epoch, config.training.epochs):
         if stopped:
@@ -527,7 +585,7 @@ def train_model(
                 # The anomaly context deliberately covers both forward and backward;
                 # otherwise PyTorch cannot report the originating forward operation.
                 with anomaly_context:
-                    with autocast_context(device, config.training.mixed_precision):
+                    with autocast_context(device, amp_enabled):
                         output_batch = model(waveforms, labels, attention_mask=masks)
                         loss = output_batch.loss
                         scaled_loss = loss / config.training.gradient_accumulation_steps
@@ -546,7 +604,10 @@ def train_model(
                             json.dumps(diagnostic_event, sort_keys=True),
                             flush=True,
                         )
-                    scaler.scale(scaled_loss).backward()
+                    if amp_enabled:
+                        scaler.scale(scaled_loss).backward()
+                    else:
+                        scaled_loss.backward()
             finally:
                 for handle in handles:
                     handle.remove()
@@ -558,18 +619,48 @@ def train_model(
                 and not is_last_batch
             ):
                 continue
-            scaler.unscale_(optimizer)
-            _assert_finite_gradients(model)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
-            final_train_loss = accumulation_loss_sum / accumulation_count
+            update_loss = accumulation_loss_sum / accumulation_count
+            update_result = _apply_optimizer_update(
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                amp_enabled=amp_enabled,
+            )
             accumulation_count = 0
             accumulation_loss_sum = 0.0
-            global_step += 1
             next_epoch = epoch
             next_batch = batch_index + 1
+
+            if not update_result.succeeded:
+                consecutive_amp_overflows += 1
+                overflow_event = {
+                    "type": "amp_overflow",
+                    "epoch": epoch,
+                    "batch": batch_index,
+                    "step": global_step,
+                    "pending_step": global_step + 1,
+                    "old_scale": update_result.old_scale,
+                    "new_scale": update_result.new_scale,
+                    "consecutive_overflows": consecutive_amp_overflows,
+                }
+                _append_history(history_path, overflow_event)
+                print(json.dumps(overflow_event, sort_keys=True), flush=True)
+                if (
+                    consecutive_amp_overflows
+                    >= config.training.max_consecutive_amp_overflows
+                ):
+                    raise TrainerError(
+                        "AMP overflow did not recover after "
+                        f"{consecutive_amp_overflows} consecutive skipped updates "
+                        f"at scale {update_result.new_scale} "
+                        f"(epoch={epoch}, batch={batch_index})."
+                    )
+                continue
+
+            consecutive_amp_overflows = 0
+            final_train_loss = update_loss
+            global_step += 1
 
             if global_step % config.training.log_every_steps == 0 or global_step == 1:
                 event = {
@@ -591,7 +682,7 @@ def train_model(
                     model,
                     data.monitor_loader,
                     device=device,
-                    amp_enabled=config.training.mixed_precision,
+                    amp_enabled=amp_enabled,
                 )
                 best_monitor_loss = min(best_monitor_loss, final_monitor_loss)
                 _append_history(
@@ -611,6 +702,7 @@ def train_model(
                 final_train_loss=final_train_loss,
                 selected_speakers=data.selected_speakers,
                 resume_signature=resume_signature,
+                consecutive_amp_overflows=consecutive_amp_overflows,
             )
             if (
                 config.training.save_every_steps is not None
@@ -648,7 +740,7 @@ def train_model(
         model,
         data.monitor_loader,
         device=device,
-        amp_enabled=config.training.mixed_precision,
+        amp_enabled=amp_enabled,
     )
     best_monitor_loss = min(best_monitor_loss, final_monitor_loss)
     _append_history(
@@ -667,6 +759,7 @@ def train_model(
         final_train_loss=final_train_loss,
         selected_speakers=data.selected_speakers,
         resume_signature=resume_signature,
+        consecutive_amp_overflows=consecutive_amp_overflows,
     )
     last_checkpoint = save_checkpoint(
         checkpoints / "last.pt",
