@@ -1,6 +1,6 @@
 experiment:
   name: vietnam_celeb_speaker_recognition
-  current_milestone: A2
+  current_milestone: A3
 
 seed: 42
 
@@ -8,7 +8,7 @@ model:
   architecture: wavlm_base_plus_campp
   wavlm_model_name: microsoft/wavlm-base-plus
   wavlm_frozen: true
-  # Stage 2 is a future option only; A2 always keeps WavLM frozen.
+  # Stage 2 is a future option only; A2/A3 keep WavLM frozen.
   stage2_enabled: false
   wavlm_hidden_dimension: 768
   adapter_dimension: 80
@@ -31,9 +31,28 @@ loss:
   scale: 30.0
 
 training:
+  epochs: 1
+  # null is deliberate: the real-data CLI requires --mini or an explicit
+  # --max-steps so invoking it cannot accidentally launch an unbounded run.
+  max_steps: null
   mixed_precision: true
-  # Engineering starting point only; A3 must validate/tune on train/validation data.
+  # Engineering starting points only; these are not tuned hyperparameters.
   learning_rate: 0.001
+  weight_decay: 0.0001
+  speakers_per_batch: 8
+  utterances_per_speaker: 2
+  num_workers: 2
+  gradient_accumulation_steps: 1
+  log_every_steps: 10
+  val_every_steps: null
+  save_every_steps: null
+  max_train_speakers: null
+  max_monitor_speakers: null
+  monitor_holdout_ratio: 0.1
+
+scheduler:
+  type: cosine
+  warmup_steps: 0
 
 output:
   # Resolved relative to module_a/ unless overridden by CLI.

@@ -1,4 +1,4 @@
-"""Small, validated YAML configuration layer for Module A A0-A2."""
+"""Small, validated YAML configuration layer for Module A A0-A3."""
 
 from __future__ import annotations
 
@@ -77,8 +77,27 @@ class LossConfig:
 
 @dataclass(frozen=True)
 class TrainingConfig:
+    epochs: int
+    max_steps: int | None
     mixed_precision: bool
     learning_rate: float
+    weight_decay: float
+    speakers_per_batch: int
+    utterances_per_speaker: int
+    num_workers: int
+    gradient_accumulation_steps: int
+    log_every_steps: int
+    val_every_steps: int | None
+    save_every_steps: int | None
+    max_train_speakers: int | None
+    max_monitor_speakers: int | None
+    monitor_holdout_ratio: float
+
+
+@dataclass(frozen=True)
+class SchedulerConfig:
+    type: str
+    warmup_steps: int
 
 
 @dataclass(frozen=True)
@@ -91,6 +110,7 @@ class ModuleAConfig:
     model: ModelConfig
     loss: LossConfig
     training: TrainingConfig
+    scheduler: SchedulerConfig
     output_root: Path
 
     def with_overrides(
@@ -162,6 +182,19 @@ def _integer(value: Any, field: str) -> int:
     return value
 
 
+def _non_negative_int(value: Any, field: str) -> int:
+    value = _integer(value, field)
+    if value < 0:
+        raise ConfigurationError(f"'{field}' must be a non-negative integer.")
+    return value
+
+
+def _optional_positive_int(value: Any, field: str) -> int | None:
+    if value is None:
+        return None
+    return _positive_int(value, field)
+
+
 def _ratio(value: Any, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise ConfigurationError(f"'{field}' must be a positive number.")
@@ -171,6 +204,16 @@ def _ratio(value: Any, field: str) -> float:
 def _positive_number(value: Any, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise ConfigurationError(f"'{field}' must be a positive number.")
+    return float(value)
+
+
+def _non_negative_number(value: Any, field: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or value < 0
+    ):
+        raise ConfigurationError(f"'{field}' must be a non-negative number.")
     return float(value)
 
 
@@ -208,7 +251,7 @@ def load_config(
     dataset_root: str | Path | None = None,
     output_root: str | Path | None = None,
 ) -> ModuleAConfig:
-    """Load A0-A2 configuration without requiring a dataset or model download."""
+    """Load A0-A3 configuration without requiring a dataset or model download."""
 
     dataset_path = Path(dataset_config_path).expanduser().resolve()
     experiment_path = Path(experiment_config_path).expanduser().resolve()
@@ -224,6 +267,7 @@ def load_config(
     model_audio_data = _mapping(experiment_document, "audio")
     loss_data = _mapping(experiment_document, "loss")
     training_data = _mapping(experiment_document, "training")
+    scheduler_data = _mapping(experiment_document, "scheduler")
 
     name = dataset_data.get("name")
     if not isinstance(name, str) or not name.strip():
@@ -373,13 +417,66 @@ def load_config(
             scale=_positive_number(loss_data.get("scale"), "loss.scale"),
         ),
         training=TrainingConfig(
+            epochs=_positive_int(training_data.get("epochs"), "training.epochs"),
+            max_steps=_optional_positive_int(
+                training_data.get("max_steps"), "training.max_steps"
+            ),
             mixed_precision=_boolean(
                 training_data.get("mixed_precision"), "training.mixed_precision"
             ),
             learning_rate=_positive_number(
                 training_data.get("learning_rate"), "training.learning_rate"
             ),
+            weight_decay=_non_negative_number(
+                training_data.get("weight_decay"), "training.weight_decay"
+            ),
+            speakers_per_batch=_positive_int(
+                training_data.get("speakers_per_batch"),
+                "training.speakers_per_batch",
+            ),
+            utterances_per_speaker=_positive_int(
+                training_data.get("utterances_per_speaker"),
+                "training.utterances_per_speaker",
+            ),
+            num_workers=_non_negative_int(
+                training_data.get("num_workers"), "training.num_workers"
+            ),
+            gradient_accumulation_steps=_positive_int(
+                training_data.get("gradient_accumulation_steps"),
+                "training.gradient_accumulation_steps",
+            ),
+            log_every_steps=_positive_int(
+                training_data.get("log_every_steps"), "training.log_every_steps"
+            ),
+            val_every_steps=_optional_positive_int(
+                training_data.get("val_every_steps"), "training.val_every_steps"
+            ),
+            save_every_steps=_optional_positive_int(
+                training_data.get("save_every_steps"), "training.save_every_steps"
+            ),
+            max_train_speakers=_optional_positive_int(
+                training_data.get("max_train_speakers"),
+                "training.max_train_speakers",
+            ),
+            max_monitor_speakers=_optional_positive_int(
+                training_data.get("max_monitor_speakers"),
+                "training.max_monitor_speakers",
+            ),
+            monitor_holdout_ratio=_ratio(
+                training_data.get("monitor_holdout_ratio"),
+                "training.monitor_holdout_ratio",
+            ),
+        ),
+        scheduler=SchedulerConfig(
+            type=_non_empty_string(scheduler_data.get("type"), "scheduler.type"),
+            warmup_steps=_non_negative_int(
+                scheduler_data.get("warmup_steps"), "scheduler.warmup_steps"
+            ),
         ),
         output_root=output_path,
     )
+    if not 0 < config.training.monitor_holdout_ratio < 1:
+        raise ConfigurationError("training.monitor_holdout_ratio must be between 0 and 1.")
+    if config.scheduler.type != "cosine":
+        raise ConfigurationError("A3 scheduler.type must be cosine.")
     return config.with_overrides(dataset_root=dataset_root, output_root=output_root)

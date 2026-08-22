@@ -2,15 +2,16 @@
 
 Module A runs separately from the FastAPI/React application. It prepares, trains,
 evaluates, calibrates, and eventually exports the speaker model consumed by Track B.
-The current implementation stops at A2. It contains architecture and optimizer sanity
-code, but no dataset training loop or model-performance evaluation.
+The current implementation stops at A3. It contains bounded mini-training
+infrastructure, but full Vietnam-Celeb training and model-performance evaluation have
+not been executed by the repository code.
 
 ## Milestones
 
 - A0: structure, lightweight configuration, reproducibility, and stable contracts — implemented.
 - A1: dataset discovery, audio metadata, eligibility filtering, speaker-disjoint manifests — implemented.
 - A2: WavLM/CAM++/AAM forward, backward, optimizer, and checkpoint sanity — implemented.
-- A3: training and checkpointing — not implemented.
+- A3: train-manifest dataset, balanced mini-training, monitoring, and resume — implemented.
 - A4: SV/SID evaluation and validation-only calibration — not implemented.
 - A5: export and local Track B ABI smoke — not implemented.
 
@@ -96,9 +97,78 @@ The atomic checkpoint contract stores `model_state_dict`, `optimizer_state_dict`
 `epoch`, `step`, the full serialized config, `num_classes`, and the train-speaker-only
 `speaker_to_index` mapping. It stores model tensors, not a Hugging Face cache directory.
 
-A2 proves model-graph correctness only. Full Vietnam-Celeb training belongs to A3;
-EER, SID evaluation, and all thresholds belong to A4; production Track B export belongs
-to A5.
+A2 proves model-graph correctness only. A3 adds bounded training infrastructure but
+does not claim a completed Vietnam-Celeb training result. EER, SID evaluation, and all
+thresholds belong to A4; production Track B export belongs to A5.
+
+## A3 mini-training
+
+The AAM classifier is built exclusively from sorted speaker IDs in the A1 **train**
+manifest. A1 validation and test speakers never enter `speaker_to_index` and are not
+used for AAM classification loss. They remain reserved for A4 embedding-based SV/SID
+evaluation and validation-only calibration.
+
+A3 creates a deterministic internal monitor holdout from train-manifest utterances:
+
+- selected train speakers define all classifier classes;
+- monitor speakers are a deterministic subset of those same classifier speakers;
+- for each monitor speaker, `floor(utterances * monitor_holdout_ratio)` samples are
+  held out, with a minimum of one monitor utterance and at least one fit utterance left;
+- one-utterance speakers remain in fit data and cannot enter the monitor subset;
+- fit and monitor paths are disjoint;
+- monitor audio uses deterministic center crop/repeat-pad, while fit audio uses seeded
+  random crop and the same repeat-padding policy for short files.
+
+Training uses a speaker-balanced batch sampler. Each batch first chooses
+`speakers_per_batch` distinct speakers uniformly, then chooses
+`utterances_per_speaker` samples uniformly for each speaker. A low-resource speaker is
+sampled with replacement only when it has too few fit utterances. The sequence is
+deterministic for the same seed and sampler epoch, so high-resource speakers do not
+dominate merely because they have more files.
+
+The Stage-1 optimizer remains AdamW over trainable adapter/CAM++/AAM parameters only;
+WavLM is frozen and excluded. The scheduler is per-update warmup plus cosine decay.
+CUDA uses `torch.autocast` and `torch.amp.GradScaler` when `mixed_precision: true`;
+CPU disables AMP safely. Non-finite losses or gradients abort the run.
+
+The real-data CLI refuses to train unless `--mini` or an explicit `--max-steps` is
+provided. A Kaggle 50-speaker/50-step smoke command is:
+
+```bash
+python -m module_a.scripts.train_model \
+  --dataset-root /kaggle/input/datasets/davidthomastran/vietnam-celeb-dataset/full-dataset/data \
+  --train-manifest /kaggle/working/module-a-outputs/train_manifest.csv \
+  --output-dir /kaggle/working/module-a-a3-mini \
+  --device cuda \
+  --mini \
+  --max-steps 50 \
+  --max-train-speakers 50 \
+  --max-monitor-speakers 10 \
+  --speakers-per-batch 8 \
+  --utterances-per-speaker 2 \
+  --num-workers 2 \
+  --amp
+```
+
+Adjust only the manifest path if A1 outputs were written elsewhere. Resume with the
+same data/config/limits and add:
+
+```bash
+--resume /kaggle/working/module-a-a3-mini/checkpoints/last.pt
+```
+
+The run writes `checkpoints/last.pt`, optional step checkpoints, `history.jsonl`,
+`run_config.json`, `speaker_to_index.json`, `train_monitor_split.json`, and
+`training_summary.json` under the untracked output directory. Resume restores model,
+optimizer, scheduler, AMP scaler, epoch/step cursor, and rejects an incompatible
+classifier mapping.
+
+Offline A3 verification uses fake WavLM and downloads nothing:
+
+```bash
+python -m module_a.scripts.train_model --help
+python -m module_a.scripts.sanity_train
+```
 
 ## Configuration
 
@@ -154,6 +224,25 @@ Speakers with fewer than `min_utterances_per_speaker: 2` usable utterances are r
 and excluded. The value 2 is an engineering eligibility default, not a calibrated
 quality threshold.
 
+### Vietnam-Celeb protocol note
+
+The Kaggle distribution contains the official Vietnam-Celeb `T`, `E`, and `H`
+protocol files, but the physically available audio in this Kaggle copy does not fully
+cover all referenced paths.
+
+Therefore:
+
+- the primary project protocol uses a reproducible speaker-disjoint 80/10/10 split
+  over the audio files physically available in the Kaggle distribution;
+- validation is used for checkpoint selection and threshold calibration;
+- the test split remains untouched until model and threshold decisions are frozen;
+- official `E` and `H` trials may be used later only as supplementary SV evaluation
+  after filtering to trials for which both referenced audio files exist;
+- any filtered `E`/`H` evaluation must report coverage and excluded-trial counts
+  explicitly;
+- `vietnam-celeb-t.txt` is not used as the primary training manifest because the
+  Kaggle audio copy does not fully cover its referenced utterances.
+
 ## Split and reproducibility policy
 
 Speakers are sorted, shuffled with a local Python RNG using seed 42, and assigned by
@@ -191,7 +280,7 @@ extract_embedding(model, audio_path)
 ```
 
 The final embedding will be a finite, fixed-dimension, L2-normalized 1-D `np.float32`
-array. A0-A2 does not modify `backend/app/models/speaker_model.py`.
+array. A0-A3 does not modify `backend/app/models/speaker_model.py`.
 
 Future exported fields remain `embedding_dimension`, `sv_threshold`, and
 `sid_threshold`. Enrollment-quality fields remain `min_duration`, `max_duration`,

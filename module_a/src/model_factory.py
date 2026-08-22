@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from torch import nn
+import math
+
 from torch.optim import AdamW, Optimizer
+from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 
 from module_a.src.config import ModuleAConfig
 from module_a.src.models.aam_softmax import AAMSoftmax
@@ -53,11 +56,39 @@ def build_model(
     return SpeakerTrainingModel(encoder, aam_head)
 
 
-def build_optimizer(model: nn.Module, learning_rate: float) -> Optimizer:
+def build_optimizer(
+    model: nn.Module,
+    learning_rate: float,
+    weight_decay: float = 0.0,
+) -> Optimizer:
     if learning_rate <= 0:
         raise ValueError("learning_rate must be positive.")
+    if weight_decay < 0:
+        raise ValueError("weight_decay must be non-negative.")
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not trainable:
         raise ValueError("Model has no trainable parameters.")
-    return AdamW(trainable, lr=learning_rate)
+    return AdamW(trainable, lr=learning_rate, weight_decay=weight_decay)
 
+
+def build_scheduler(
+    optimizer: Optimizer,
+    *,
+    scheduler_type: str,
+    total_steps: int,
+    warmup_steps: int = 0,
+) -> LRScheduler:
+    """Build the A3 per-optimizer-step warmup/cosine schedule."""
+
+    if scheduler_type != "cosine":
+        raise ValueError("Only the A3 cosine scheduler is supported.")
+    if total_steps <= 0 or warmup_steps < 0 or warmup_steps >= total_steps:
+        raise ValueError("Scheduler steps require 0 <= warmup_steps < total_steps.")
+
+    def multiplier(step: int) -> float:
+        if warmup_steps and step < warmup_steps:
+            return float(step + 1) / float(warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
+
+    return LambdaLR(optimizer, lr_lambda=multiplier)

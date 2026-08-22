@@ -11,6 +11,7 @@ from module_a.src.audio_batch import (
     AudioBatchError,
     collate_fixed_waveforms,
     fit_waveform_to_segment,
+    fit_waveform_to_segment_random,
     load_waveform,
 )
 
@@ -51,6 +52,20 @@ def test_audio_batch_rejects_invalid_rank_and_nan():
     waveform[0] = float("nan")
     with pytest.raises(AudioBatchError, match="finite"):
         fit_waveform_to_segment(waveform, 20)
+
+
+def test_train_random_crop_is_seeded_and_short_audio_still_repeat_pads():
+    waveform = torch.arange(20, dtype=torch.float32)
+    torch.manual_seed(42)
+    first = fit_waveform_to_segment_random(waveform, 5)
+    torch.manual_seed(42)
+    second = fit_waveform_to_segment_random(waveform, 5)
+
+    assert torch.equal(first, second)
+    assert torch.equal(
+        fit_waveform_to_segment_random(torch.tensor([1.0, 2.0]), 5),
+        torch.tensor([1.0, 2.0, 1.0, 2.0, 1.0]),
+    )
 
 
 def test_real_smoke_help_does_not_load_or_download_model():

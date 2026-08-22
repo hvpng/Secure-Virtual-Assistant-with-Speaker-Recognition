@@ -1,4 +1,4 @@
-"""Minimal deterministic waveform loading and fixed-segment collation for A2."""
+"""Shared A2/A3 waveform loading and fixed-segment collation."""
 
 from __future__ import annotations
 
@@ -81,6 +81,26 @@ def fit_waveform_to_segment(waveform: Tensor, segment_samples: int) -> Tensor:
         return waveform[start : start + segment_samples].contiguous()
     repeats = math.ceil(segment_samples / waveform.numel())
     return waveform.repeat(repeats)[:segment_samples].contiguous()
+
+
+def fit_waveform_to_segment_random(waveform: Tensor, segment_samples: int) -> Tensor:
+    """Random-crop long training audio and preserve A2 repeat-padding for short audio.
+
+    ``torch.randint`` intentionally uses the current process/worker torch RNG. A3
+    seeds the main process and each DataLoader worker explicitly.
+    """
+
+    if waveform.ndim != 1:
+        raise AudioBatchError("Each waveform must be a rank-1 mono tensor.")
+    if waveform.numel() == 0 or segment_samples <= 0:
+        raise AudioBatchError("Waveform and segment length must be non-empty.")
+    if not waveform.is_floating_point() or not torch.isfinite(waveform).all():
+        raise AudioBatchError("Waveform must be finite floating-point audio.")
+    if waveform.numel() <= segment_samples:
+        return fit_waveform_to_segment(waveform, segment_samples)
+    max_start = waveform.numel() - segment_samples
+    start = int(torch.randint(max_start + 1, (1,)).item())
+    return waveform[start : start + segment_samples].contiguous()
 
 
 def collate_fixed_waveforms(
