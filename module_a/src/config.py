@@ -103,6 +103,15 @@ class SchedulerConfig:
 
 
 @dataclass(frozen=True)
+class EvaluationConfig:
+    embedding_batch_size: int
+    mixed_precision: bool
+    max_sv_positive_per_speaker: int
+    sid_known_ratio: float
+    sid_max_enrollment: int
+
+
+@dataclass(frozen=True)
 class ModuleAConfig:
     seed: int
     dataset: DatasetConfig
@@ -113,6 +122,7 @@ class ModuleAConfig:
     loss: LossConfig
     training: TrainingConfig
     scheduler: SchedulerConfig
+    evaluation: EvaluationConfig
     output_root: Path
 
     def with_overrides(
@@ -270,6 +280,7 @@ def load_config(
     loss_data = _mapping(experiment_document, "loss")
     training_data = _mapping(experiment_document, "training")
     scheduler_data = _mapping(experiment_document, "scheduler")
+    evaluation_data = _mapping(experiment_document, "evaluation")
 
     name = dataset_data.get("name")
     if not isinstance(name, str) or not name.strip():
@@ -483,10 +494,34 @@ def load_config(
                 scheduler_data.get("warmup_steps"), "scheduler.warmup_steps"
             ),
         ),
+        evaluation=EvaluationConfig(
+            embedding_batch_size=_positive_int(
+                evaluation_data.get("embedding_batch_size"),
+                "evaluation.embedding_batch_size",
+            ),
+            mixed_precision=_boolean(
+                evaluation_data.get("mixed_precision", False),
+                "evaluation.mixed_precision",
+            ),
+            max_sv_positive_per_speaker=_positive_int(
+                evaluation_data.get("max_sv_positive_per_speaker"),
+                "evaluation.max_sv_positive_per_speaker",
+            ),
+            sid_known_ratio=_ratio(
+                evaluation_data.get("sid_known_ratio"),
+                "evaluation.sid_known_ratio",
+            ),
+            sid_max_enrollment=_positive_int(
+                evaluation_data.get("sid_max_enrollment"),
+                "evaluation.sid_max_enrollment",
+            ),
+        ),
         output_root=output_path,
     )
     if not 0 < config.training.monitor_holdout_ratio < 1:
         raise ConfigurationError("training.monitor_holdout_ratio must be between 0 and 1.")
     if config.scheduler.type != "cosine":
         raise ConfigurationError("A3 scheduler.type must be cosine.")
+    if not 0 < config.evaluation.sid_known_ratio < 1:
+        raise ConfigurationError("evaluation.sid_known_ratio must be between 0 and 1.")
     return config.with_overrides(dataset_root=dataset_root, output_root=output_root)

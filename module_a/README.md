@@ -2,9 +2,9 @@
 
 Module A runs separately from the FastAPI/React application. It prepares, trains,
 evaluates, calibrates, and eventually exports the speaker model consumed by Track B.
-The current implementation stops at A3. It contains bounded mini-training
-infrastructure, but full Vietnam-Celeb training and model-performance evaluation have
-not been executed by the repository code.
+The current implementation stops at A4. It contains Stage-1 training infrastructure
+and reproducible SV/SID evaluation with validation-only calibration. Real A4 metric
+values are intentionally not claimed until the frozen Kaggle checkpoint is evaluated.
 
 ## Milestones
 
@@ -12,7 +12,7 @@ not been executed by the repository code.
 - A1: dataset discovery, audio metadata, eligibility filtering, speaker-disjoint manifests — implemented.
 - A2: WavLM/CAM++/AAM forward, backward, optimizer, and checkpoint sanity — implemented.
 - A3: train-manifest dataset, balanced mini-training, monitoring, and resume — implemented.
-- A4: SV/SID evaluation and validation-only calibration — not implemented.
+- A4: SV/SID evaluation and validation-only calibration — implemented.
 - A5: export and local Track B ABI smoke — not implemented.
 
 ## Environment
@@ -204,6 +204,78 @@ python -m module_a.scripts.train_model \
 ```
 
 Use `--amp` instead of `--no-amp` only for the corresponding AMP reproduction.
+
+## A4 speaker-disjoint evaluation
+
+A4 reconstructs the frozen A3 checkpoint and scores only L2-normalized 192-D encoder
+embeddings. The AAM classifier is loaded only so the checkpoint can be reconstructed
+strictly; it is never used to predict validation or test identities. Embedding
+extraction uses deterministic center crop/repeat-pad, `model.eval()`, `torch.no_grad()`,
+and FP32 by default. Per-split `.npz` caches bind the embeddings to the checkpoint,
+manifest, evaluation config, dataset root, split, and embedding dimension. An
+incompatible cache fails explicitly unless `--recompute-embeddings` is passed.
+
+SV uses bounded same-speaker unordered pairs with no self-pairs. Each speaker gets at
+most `max_sv_positive_per_speaker` deterministic positive trials. The protocol then
+samples an equal number of unique different-speaker negative pairs using seed 42.
+Cosine similarity is the dot product of normalized embeddings. EER is the average of
+FAR and FRR at the empirical score threshold minimizing `abs(FAR - FRR)`; it is not
+interpolated, and equal objectives prefer the higher threshold. That validation EER
+threshold is the frozen deployment SV threshold. Test EER and its threshold are
+descriptive only; test FAR/FRR use the persisted validation threshold.
+
+Open-set SID is built independently inside each split. Seeded selection assigns 80%
+of speakers (round-half-up, with both sets kept non-empty) to known and the rest to
+unknown. Each known speaker contributes at most five deterministic enrollment
+utterances and retains at least one disjoint probe; unknown speakers contribute no
+enrollment and all their utterances are probes. Enrollment embeddings are averaged
+and L2-normalized into prototypes. SID calibration maximizes validation overall
+open-set accuracy, where known probes are correct only when accepted with the right
+identity and unknown probes are correct only when rejected. Ties prefer the higher,
+more conservative threshold.
+
+Validation and test speakers and paths are checked against each other and against the
+checkpoint's train-only `speaker_to_index`. Validation is the only phase that writes
+`calibration/sv_calibration.json` and `calibration/sid_calibration.json`. Test mode
+refuses to start without both persisted validation artifacts, reloads them before
+scoring, and never recalibrates or overwrites them. A1 validation/test remain the
+primary speaker-disjoint protocol; incomplete official Vietnam-Celeb E/H files are
+not used by this A4 implementation.
+
+Validation-only Kaggle command:
+
+```bash
+python -m module_a.scripts.evaluate_model \
+  --phase validation \
+  --dataset-root /kaggle/input/datasets/davidthomastran/vietnam-celeb-dataset/full-dataset/data \
+  --val-manifest /kaggle/working/module_a_outputs/val_manifest.csv \
+  --checkpoint /kaggle/working/module_a-stage1-full/checkpoints/last.pt \
+  --output-dir /kaggle/working/module_a_a4 \
+  --device cuda
+```
+
+Only after reviewing/fixing the validation protocol and freezing its two calibration
+JSON files, run test-only evaluation against the same output directory:
+
+```bash
+python -m module_a.scripts.evaluate_model \
+  --phase test \
+  --dataset-root /kaggle/input/datasets/davidthomastran/vietnam-celeb-dataset/full-dataset/data \
+  --val-manifest /kaggle/working/module_a_outputs/val_manifest.csv \
+  --test-manifest /kaggle/working/module_a_outputs/test_manifest.csv \
+  --checkpoint /kaggle/working/module_a-stage1-full/checkpoints/last.pt \
+  --output-dir /kaggle/working/module_a_a4 \
+  --device cuda
+```
+
+The output tree contains `embeddings/`, `trials/`, `protocols/`, `scores/`,
+`calibration/`, `metrics/`, `run_config.json`, and `evaluation_summary.json`. Local
+offline verification never downloads WavLM:
+
+```bash
+python -m module_a.scripts.evaluate_model --help
+python -m module_a.scripts.sanity_evaluation
+```
 
 ## Configuration
 

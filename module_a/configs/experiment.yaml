@@ -1,6 +1,6 @@
 experiment:
   name: vietnam_celeb_speaker_recognition
-  current_milestone: A3
+  current_milestone: A4
 
 seed: 42
 
@@ -57,6 +57,14 @@ training:
 scheduler:
   type: cosine
   warmup_steps: 0
+
+evaluation:
+  # A4 scoring is FP32 by default for numerical robustness.
+  mixed_precision: false
+  embedding_batch_size: 8
+  max_sv_positive_per_speaker: 20
+  sid_known_ratio: 0.8
+  sid_max_enrollment: 5
 
 output:
   # Resolved relative to module_a/ unless overridden by CLI.
