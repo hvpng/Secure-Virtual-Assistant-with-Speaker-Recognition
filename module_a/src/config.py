@@ -111,6 +111,7 @@ class EvaluationConfig:
     sv_target_far: float
     sid_known_ratio: float
     sid_max_enrollment: int
+    sid_target_unknown_far: float
 
 
 @dataclass(frozen=True)
@@ -521,6 +522,10 @@ def load_config(
                 evaluation_data.get("sid_max_enrollment"),
                 "evaluation.sid_max_enrollment",
             ),
+            sid_target_unknown_far=_non_negative_number(
+                evaluation_data.get("sid_target_unknown_far", 0.05),
+                "evaluation.sid_target_unknown_far",
+            ),
         ),
         output_root=output_path,
     )
@@ -535,4 +540,11 @@ def load_config(
         or config.evaluation.sv_target_far > 1
     ):
         raise ConfigurationError("evaluation.sv_target_far must be between 0 and 1.")
+    if (
+        not math.isfinite(config.evaluation.sid_target_unknown_far)
+        or config.evaluation.sid_target_unknown_far > 1
+    ):
+        raise ConfigurationError(
+            "evaluation.sid_target_unknown_far must be between 0 and 1."
+        )
     return config.with_overrides(dataset_root=dataset_root, output_root=output_root)

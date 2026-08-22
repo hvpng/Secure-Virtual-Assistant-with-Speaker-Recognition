@@ -24,8 +24,8 @@ from module_a.src.training_data import TrainingRecord
 
 
 UNKNOWN_IDENTITY = "UNKNOWN"
-SID_CALIBRATION_SCHEMA_VERSION = 2
-SID_CALIBRATION_POLICY_VERSION = "sid_balanced_open_set_accuracy_v1"
+SID_CALIBRATION_SCHEMA_VERSION = 3
+SID_CALIBRATION_POLICY_VERSION = "sid_target_unknown_far_v1"
 
 
 @dataclass(frozen=True)
@@ -312,24 +312,59 @@ def sid_score_distributions(scores: Sequence[SIDProbeScore]) -> dict[str, Any]:
     }
 
 
-def calibrate_sid_threshold(scores: Sequence[SIDProbeScore]) -> dict[str, Any]:
-    candidates = [sid_metrics_at_threshold(scores, value) for value in _sid_thresholds(scores)]
-    selected = max(
-        candidates,
+def select_sid_target_unknown_far_operating_point(
+    scores: Sequence[SIDProbeScore], target_unknown_far: float
+) -> dict[str, Any]:
+    """Select the empirical SID deployment point without interpolation.
+
+    The threshold maximizes the known accepted-correct rate among candidates whose
+    unknown false-accept rate does not exceed ``target_unknown_far``. Equal primary
+    objectives prefer the higher threshold. The above-maximum sentinel guarantees a
+    reject-all candidate with zero unknown false accepts.
+    """
+
+    if (
+        not math.isfinite(target_unknown_far)
+        or not 0.0 <= target_unknown_far <= 1.0
+    ):
+        raise EvaluationError(
+            "SID target unknown FAR must be finite and between 0 and 1."
+        )
+    candidates = [
+        sid_metrics_at_threshold(scores, value) for value in _sid_thresholds(scores)
+    ]
+    feasible = [
+        metrics
+        for metrics in candidates
+        if metrics["unknown_false_accept_rate"] <= target_unknown_far
+    ]
+    if not feasible:  # Defensive: reject-all sentinel should always be feasible.
+        raise EvaluationError("No empirical SID threshold satisfies target unknown FAR.")
+    return max(
+        feasible,
         key=lambda metrics: (
-            metrics["balanced_open_set_accuracy"],
+            metrics["known_accepted_correct_rate"],
             metrics["threshold"],
         ),
+    )
+
+
+def calibrate_sid_threshold(
+    scores: Sequence[SIDProbeScore], *, target_unknown_far: float = 0.05
+) -> dict[str, Any]:
+    selected = select_sid_target_unknown_far_operating_point(
+        scores, target_unknown_far
     )
     return {
         "calibration_schema_version": SID_CALIBRATION_SCHEMA_VERSION,
         "calibration_policy_version": SID_CALIBRATION_POLICY_VERSION,
         "source_split": "validation",
-        "objective": "maximize validation balanced open-set accuracy",
-        "objective_formula": (
-            "0.5 * known_accepted_correct_rate + "
-            "0.5 * unknown_rejection_rate"
+        "objective": (
+            "maximize validation known accepted-correct rate subject to "
+            "unknown FAR target"
         ),
+        "deployment_policy": "target_unknown_far",
+        "deployment_target_unknown_far": float(target_unknown_far),
         "tie_breaker": "higher threshold",
         "selected_threshold": selected["threshold"],
         **{key: value for key, value in selected.items() if key != "threshold"},
@@ -344,6 +379,7 @@ def load_frozen_sid_calibration(
 ) -> dict[str, Any]:
     calibration = read_json_object(path)
     threshold = calibration.get("selected_threshold")
+    target_unknown_far = calibration.get("deployment_target_unknown_far")
     if (
         calibration.get("calibration_schema_version")
         != SID_CALIBRATION_SCHEMA_VERSION
@@ -351,9 +387,16 @@ def load_frozen_sid_calibration(
         != SID_CALIBRATION_POLICY_VERSION
         or calibration.get("source_split") != "validation"
         or calibration.get("objective")
-        != "maximize validation balanced open-set accuracy"
+        != (
+            "maximize validation known accepted-correct rate subject to "
+            "unknown FAR target"
+        )
+        or calibration.get("deployment_policy") != "target_unknown_far"
         or not isinstance(threshold, (int, float))
         or not math.isfinite(float(threshold))
+        or not isinstance(target_unknown_far, (int, float))
+        or not math.isfinite(float(target_unknown_far))
+        or not 0 <= float(target_unknown_far) <= 1
     ):
         raise EvaluationError("SID calibration is not a frozen validation artifact.")
     for key, expected in (expected_provenance or {}).items():
@@ -366,10 +409,13 @@ def write_sid_calibration(
     path: str | Path,
     scores: Sequence[SIDProbeScore],
     *,
+    target_unknown_far: float = 0.05,
     provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     calibration = dict(provenance or {})
-    calibration.update(calibrate_sid_threshold(scores))
+    calibration.update(
+        calibrate_sid_threshold(scores, target_unknown_far=target_unknown_far)
+    )
     calibration["source_split"] = "validation"
     write_json_atomic(path, calibration)
     return calibration

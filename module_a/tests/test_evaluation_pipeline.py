@@ -82,6 +82,8 @@ def test_test_consumes_frozen_validation_thresholds_without_overwrite(tmp_path):
     assert before == (sv_path.read_bytes(), sid_path.read_bytes())
     assert test["sv"]["metrics"]["frozen_validation_sv_deployment_threshold"] == validation["sv"]["calibration"]["deployment_threshold"]
     assert test["sid"]["metrics"]["frozen_validation_sid_threshold"] == validation["sid"]["calibration"]["selected_threshold"]
+    assert test["sid"]["metrics"]["frozen_validation_sid_target_unknown_far"] == 0.05
+    assert validation["sid"]["calibration"]["deployment_policy"] == "target_unknown_far"
     assert validation["sv"]["metrics"]["eer_threshold"] == validation["sv"]["calibration"]["eer_threshold"]
     assert validation["sv"]["metrics"]["deployment_target_far"] == 0.05
 
@@ -165,7 +167,9 @@ def test_old_sid_raw_accuracy_policy_is_rejected(tmp_path):
     )
     sid_path = tmp_path / "calibration" / "sid_calibration.json"
     sid = json.loads(sid_path.read_text(encoding="utf-8"))
-    sid["objective"] = "maximize validation overall open-set accuracy"
+    sid["calibration_schema_version"] = 2
+    sid["calibration_policy_version"] = "sid_balanced_open_set_accuracy_v1"
+    sid["objective"] = "maximize validation balanced open-set accuracy"
     sid_path.write_text(json.dumps(sid), encoding="utf-8")
     with pytest.raises(EvaluationError, match="frozen validation artifact"):
         require_frozen_calibrations(tmp_path)

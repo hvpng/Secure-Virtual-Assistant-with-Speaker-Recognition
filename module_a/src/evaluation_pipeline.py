@@ -78,6 +78,7 @@ def run_validation_protocols(
     sid_known_ratio: float,
     sid_max_enrollment: int,
     sv_target_far: float = 0.05,
+    sid_target_unknown_far: float = 0.05,
     calibration_provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Calibrate SV and SID exclusively from A1 validation speakers."""
@@ -127,13 +128,20 @@ def run_validation_protocols(
     prototypes = build_sid_prototypes(sid_protocol, embeddings)
     sid_scores = score_sid_probes(sid_protocol, embeddings, prototypes)
     sid_calibration = write_sid_calibration(
-        paths["sid_calibration"], sid_scores, provenance=calibration_provenance
+        paths["sid_calibration"],
+        sid_scores,
+        target_unknown_far=sid_target_unknown_far,
+        provenance=calibration_provenance,
     )
     sid_threshold = float(sid_calibration["selected_threshold"])
     sid_metrics = sid_metrics_at_threshold(sid_scores, sid_threshold)
     sid_metrics.update(sid_score_distributions(sid_scores))
     sid_metrics["source_threshold"] = "validation_calibration"
     sid_metrics["calibration_objective"] = sid_calibration["objective"]
+    sid_metrics["deployment_policy"] = sid_calibration["deployment_policy"]
+    sid_metrics["deployment_target_unknown_far"] = sid_calibration[
+        "deployment_target_unknown_far"
+    ]
     write_sid_scores(paths["sid_scores"], sid_scores, threshold=sid_threshold)
     write_json_atomic(paths["sid_metrics"], sid_metrics)
 
@@ -213,6 +221,9 @@ def run_test_protocols(
     sid_metrics = sid_metrics_at_threshold(sid_scores, sid_threshold)
     sid_metrics.update(sid_score_distributions(sid_scores))
     sid_metrics["frozen_validation_sid_threshold"] = sid_threshold
+    sid_metrics["frozen_validation_sid_target_unknown_far"] = sid_calibration[
+        "deployment_target_unknown_far"
+    ]
     sid_metrics["source_threshold"] = "persisted_validation_calibration"
     write_sid_scores(paths["sid_scores"], sid_scores, threshold=sid_threshold)
     write_json_atomic(paths["sid_metrics"], sid_metrics)

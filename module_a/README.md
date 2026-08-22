@@ -246,11 +246,12 @@ unknown. Each known speaker contributes at most five deterministic enrollment
 utterances and retains at least one disjoint probe; unknown speakers contribute no
 enrollment and all their utterances are probes. Enrollment embeddings are averaged
 and L2-normalized into prototypes. Known top-1 identity accuracy remains a separate,
-threshold-independent intrinsic metric. SID deployment calibration maximizes
-`0.5 * known_accepted_correct_rate + 0.5 * unknown_rejection_rate`, giving the known
-and unknown probe classes equal aggregate weight even when their counts differ. Raw
-overall open-set accuracy is still reported but is not optimized. Ties prefer the
-higher, more conservative threshold.
+threshold-independent intrinsic metric. SID deployment calibration first restricts
+empirical candidates to `unknown_false_accept_rate <= sid_target_unknown_far`
+(default 0.05), then maximizes `known_accepted_correct_rate`. Equal objectives prefer
+the higher threshold, and a reject-all sentinel guarantees a zero-unknown-FAR
+fallback. Balanced and raw overall open-set accuracy remain descriptive metrics and
+are not optimized.
 
 Validation and test speakers and paths are checked against each other and against the
 checkpoint's train-only `speaker_to_index`. Validation is the only phase that writes
@@ -258,7 +259,7 @@ checkpoint's train-only `speaker_to_index`. Validation is the only phase that wr
 refuses to start without both persisted validation artifacts, reloads them before
 scoring, and never recalibrates or overwrites them. Calibration artifacts bind the
 policy/schema version, checkpoint SHA256, validation manifest fingerprint, seed,
-protocol settings, and SV target FAR. A1 validation/test remain the primary
+protocol settings, SV target FAR, and SID target unknown FAR. A1 validation/test remain the primary
 speaker-disjoint protocol; incomplete official Vietnam-Celeb E/H files are not used
 by this A4 implementation. Threshold-policy changes do not invalidate compatible
 embedding caches because cache identity is bound separately to the model, manifest,
@@ -278,6 +279,7 @@ python -m module_a.scripts.evaluate_model \
   --max-sv-positive-per-speaker 20 \
   --sid-known-ratio 0.8 \
   --sid-max-enrollment 5 \
+  --sid-target-unknown-far 0.05 \
   --sv-target-far 0.05
 ```
 

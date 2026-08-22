@@ -50,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sv-target-far", type=float)
     parser.add_argument("--sid-known-ratio", type=float)
     parser.add_argument("--sid-max-enrollment", type=int)
+    parser.add_argument("--sid-target-unknown-far", type=float)
     parser.add_argument("--recompute-embeddings", action="store_true")
     parser.add_argument("--local-files-only", action="store_true")
     return parser
@@ -68,6 +69,11 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("--sid-known-ratio must be between 0 and 1")
     if args.sid_max_enrollment is not None and args.sid_max_enrollment <= 0:
         parser.error("--sid-max-enrollment must be positive")
+    if args.sid_target_unknown_far is not None and (
+        not math.isfinite(args.sid_target_unknown_far)
+        or not 0 <= args.sid_target_unknown_far <= 1
+    ):
+        parser.error("--sid-target-unknown-far must be finite and between 0 and 1")
 
 
 def _base_summary(bundle: Any, *, device: Any, seed: int) -> dict[str, Any]:
@@ -141,6 +147,11 @@ def main(argv: list[str] | None = None) -> int:
             if args.sid_max_enrollment is None
             else args.sid_max_enrollment
         ),
+        sid_target_unknown_far=(
+            bundle.config.evaluation.sid_target_unknown_far
+            if args.sid_target_unknown_far is None
+            else args.sid_target_unknown_far
+        ),
     )
     bundle = replace(
         bundle,
@@ -163,6 +174,7 @@ def main(argv: list[str] | None = None) -> int:
         "sv_target_far": evaluation.sv_target_far,
         "sid_known_ratio": evaluation.sid_known_ratio,
         "sid_max_enrollment": evaluation.sid_max_enrollment,
+        "sid_target_unknown_far": evaluation.sid_target_unknown_far,
     }
 
     run_config = {
@@ -209,6 +221,7 @@ def main(argv: list[str] | None = None) -> int:
             sid_known_ratio=evaluation.sid_known_ratio,
             sid_max_enrollment=evaluation.sid_max_enrollment,
             sv_target_far=evaluation.sv_target_far,
+            sid_target_unknown_far=evaluation.sid_target_unknown_far,
             calibration_provenance=calibration_provenance,
         )
         summary["protocol"].update(

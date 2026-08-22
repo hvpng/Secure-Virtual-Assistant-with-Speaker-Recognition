@@ -140,8 +140,10 @@ def main() -> int:
             "validation_sv_eer_threshold": validation["sv"]["calibration"]["eer_threshold"],
             "validation_sv_deployment_threshold": validation["sv"]["calibration"]["deployment_threshold"],
             "validation_sid_threshold": validation["sid"]["calibration"]["selected_threshold"],
+            "validation_sid_target_unknown_far": validation["sid"]["calibration"]["deployment_target_unknown_far"],
             "test_sv_frozen_threshold": test["sv"]["metrics"]["frozen_validation_sv_deployment_threshold"],
             "test_sid_frozen_threshold": test["sid"]["metrics"]["frozen_validation_sid_threshold"],
+            "test_sid_frozen_target_unknown_far": test["sid"]["metrics"]["frozen_validation_sid_target_unknown_far"],
             "artifacts_verified": len(required),
             "status": "passed",
         }
