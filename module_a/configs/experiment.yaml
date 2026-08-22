@@ -31,7 +31,7 @@ loss:
   scale: 30.0
 
 training:
-  epochs: 1
+  epochs: 3
   # null is deliberate: the real-data CLI requires --mini or an explicit
   # --max-steps so invoking it cannot accidentally launch an unbounded run.
   max_steps: null
@@ -41,15 +41,15 @@ training:
   # Engineering starting points only; these are not tuned hyperparameters.
   learning_rate: 0.001
   weight_decay: 0.0001
-  speakers_per_batch: 8
+  speakers_per_batch: 16
   utterances_per_speaker: 2
   num_workers: 2
   gradient_accumulation_steps: 1
   log_every_steps: 10
-  val_every_steps: null
-  save_every_steps: null
+  val_every_steps: 2171
+  save_every_steps: 2171
   max_train_speakers: null
-  max_monitor_speakers: null
+  max_monitor_speakers: 100
   monitor_holdout_ratio: 0.1
   # Abort instead of retrying forever if lowering the AMP scale never recovers.
   max_consecutive_amp_overflows: 20
