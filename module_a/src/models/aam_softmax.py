@@ -38,7 +38,7 @@ class AAMSoftmax(nn.Module):
         self.monotonic_threshold = math.cos(math.pi - margin)
         self.margin_correction = math.sin(math.pi - margin) * margin
 
-    def forward(self, embeddings: Tensor, labels: Tensor) -> Tensor:
+    def _validate_inputs(self, embeddings: Tensor, labels: Tensor) -> None:
         if embeddings.ndim != 2 or embeddings.shape[1] != self.embedding_dimension:
             raise AAMSoftmaxError(
                 "AAM embeddings must have shape [batch, embedding_dimension]."
@@ -54,12 +54,20 @@ class AAMSoftmax(nn.Module):
         if not torch.isfinite(embeddings).all():
             raise AAMSoftmaxError("AAM embeddings contain NaN or infinity.")
 
+    def _compute_tensors(
+        self, embeddings: Tensor, labels: Tensor
+    ) -> dict[str, Tensor]:
+        """Compute the exact forward intermediates without changing loss semantics."""
+
+        self._validate_inputs(embeddings, labels)
+
         normalized_embeddings = F.normalize(embeddings, dim=1, eps=1e-6)
         normalized_weights = F.normalize(self.weight, dim=1, eps=1e-6)
         cosine = F.linear(normalized_embeddings, normalized_weights).clamp(
             -1.0 + 1e-6, 1.0 - 1e-6
         )
-        sine = torch.sqrt((1.0 - cosine.square()).clamp_min(1e-6))
+        sine_squared = 1.0 - cosine.square()
+        sine = torch.sqrt(sine_squared.clamp_min(1e-6))
         margin_cosine = cosine * self.cos_margin - sine * self.sin_margin
         margin_cosine = torch.where(
             cosine > self.monotonic_threshold,
@@ -72,7 +80,29 @@ class AAMSoftmax(nn.Module):
         logits = self.scale * (one_hot * margin_cosine + (1.0 - one_hot) * cosine)
         if not torch.isfinite(logits).all():
             raise AAMSoftmaxError("AAM produced non-finite logits.")
-        return logits
+        return {
+            "normalized_embedding": normalized_embeddings,
+            "normalized_weight": normalized_weights,
+            "cosine": cosine,
+            "sine_squared_before_clamp": sine_squared,
+            "sine": sine,
+            "margin_cosine": margin_cosine,
+            "logits": logits,
+        }
+
+    def forward(self, embeddings: Tensor, labels: Tensor) -> Tensor:
+        return self._compute_tensors(embeddings, labels)["logits"]
+
+    @torch.no_grad()
+    def numerical_diagnostics(
+        self, embeddings: Tensor, labels: Tensor
+    ) -> dict[str, Tensor]:
+        """Return detached first-step intermediates for opt-in A3 diagnostics."""
+
+        return {
+            name: tensor.detach()
+            for name, tensor in self._compute_tensors(embeddings, labels).items()
+        }
 
     def loss(self, embeddings: Tensor, labels: Tensor) -> Tensor:
         loss = F.cross_entropy(self(embeddings, labels), labels.to(torch.int64))

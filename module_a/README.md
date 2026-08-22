@@ -170,6 +170,35 @@ python -m module_a.scripts.train_model --help
 python -m module_a.scripts.sanity_train
 ```
 
+### Non-finite backward diagnostics
+
+Anomaly tracing is opt-in because it is intentionally slow. `--detect-anomaly` wraps
+both the forward and backward pass with `torch.autograd.detect_anomaly(check_nan=True)`
+so PyTorch can report the forward operation whose backward first emits NaN/Inf. It
+also prints compact first-batch statistics; `--debug-first-step` prints the same
+statistics without enabling anomaly tracing. Neither flag changes the default run.
+
+One real non-AMP batch on Kaggle:
+
+```bash
+python -m module_a.scripts.train_model \
+  --dataset-root /kaggle/input/datasets/davidthomastran/vietnam-celeb-dataset/full-dataset/data \
+  --train-manifest /kaggle/working/module-a-outputs/train_manifest.csv \
+  --output-dir /kaggle/working/module-a-a3-anomaly \
+  --device cuda \
+  --mini \
+  --max-steps 1 \
+  --max-train-speakers 50 \
+  --max-monitor-speakers 10 \
+  --speakers-per-batch 8 \
+  --utterances-per-speaker 2 \
+  --num-workers 2 \
+  --no-amp \
+  --detect-anomaly
+```
+
+Use `--amp` instead of `--no-amp` only for the corresponding AMP reproduction.
+
 ## Configuration
 
 `configs/dataset.yaml` is the A1 source of truth. The dataset root is intentionally

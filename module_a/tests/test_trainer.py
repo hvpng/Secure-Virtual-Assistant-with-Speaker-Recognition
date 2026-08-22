@@ -70,7 +70,7 @@ def new_model(config, num_classes):
 
 
 def test_cpu_one_step_changes_backend_not_frozen_frontend_and_writes_outputs(
-    tmp_path, write_wav, small_model_config
+    tmp_path, write_wav, small_model_config, capsys
 ):
     config, data = build_training_fixture(
         tmp_path, write_wav, small_model_config, max_steps=1
@@ -88,7 +88,9 @@ def test_cpu_one_step_changes_backend_not_frozen_frontend_and_writes_outputs(
         data=data,
         device=torch.device("cpu"),
         output_dir=tmp_path / "run",
+        debug_first_step=True,
     )
+    captured = capsys.readouterr().out
 
     assert result.global_step == 1
     assert math.isfinite(result.final_train_loss)
@@ -99,6 +101,9 @@ def test_cpu_one_step_changes_backend_not_frozen_frontend_and_writes_outputs(
         for name, parameter in model.encoder.frontend.named_parameters()
     )
     assert create_grad_scaler(torch.device("cpu"), True).is_enabled() is False
+    assert "numerical_diagnostics_before_backward" in captured
+    assert "campp_pool_variance_before_clamp" in captured
+    assert "aam_sine_squared_before_clamp" in captured
     for filename in (
         "history.jsonl",
         "run_config.json",
@@ -122,6 +127,7 @@ def test_resume_restores_step_optimizer_scheduler_and_rejects_mapping_mismatch(
         device=torch.device("cpu"),
         output_dir=tmp_path / "run",
         stop_after_steps=1,
+        detect_anomaly=True,
     )
     restored_model = new_model(config, len(data.speaker_to_index))
     resumed = train_model(
@@ -197,3 +203,5 @@ def test_train_cli_help_is_offline_and_exposes_safety_limits():
     assert "--mini" in result.stdout
     assert "--max-steps" in result.stdout
     assert "--resume" in result.stdout
+    assert "--detect-anomaly" in result.stdout
+    assert "--debug-first-step" in result.stdout

@@ -3,7 +3,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from module_a.src.models.campp import CAMPlusPlus, CAMPlusPlusError
+from module_a.src.models.campp import (
+    CAMPlusPlus,
+    CAMPlusPlusError,
+    StatisticsPooling,
+)
 
 
 def small_campp() -> CAMPlusPlus:
@@ -57,3 +61,15 @@ def test_campp_normal_length_backward_reaches_dense_layers():
         if parameter.grad is not None
     )
 
+
+def test_statistics_pooling_zero_variance_std_and_backward_are_finite():
+    pooling = StatisticsPooling()
+    inputs = torch.ones(2, 3, 4, requires_grad=True)
+
+    output = pooling(inputs)
+    output.sum().backward()
+
+    expected_std = torch.full((2, 3), 1e-5**0.5)
+    assert torch.allclose(output[:, 3:], expected_std)
+    assert inputs.grad is not None
+    assert torch.isfinite(inputs.grad).all()

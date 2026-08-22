@@ -7,6 +7,7 @@ import math
 import os
 import tempfile
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -96,6 +97,104 @@ def _append_history(path: Path, event: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(dict(event), ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _tensor_summary(tensor: Tensor) -> dict[str, int | float | bool | None | str]:
+    values = tensor.detach().to(torch.float32).reshape(-1)
+    finite_mask = torch.isfinite(values)
+    finite_values = values[finite_mask]
+    finite_count = int(finite_mask.sum().item())
+    summary: dict[str, int | float | bool | None | str] = {
+        "dtype": str(tensor.dtype),
+        "numel": values.numel(),
+        "finite": finite_count == values.numel(),
+        "non_finite_count": values.numel() - finite_count,
+        "min": None,
+        "max": None,
+        "mean": None,
+        "std": None,
+    }
+    if finite_count:
+        summary.update(
+            {
+                "min": float(finite_values.min().item()),
+                "max": float(finite_values.max().item()),
+                "mean": float(finite_values.mean().item()),
+                "std": float(finite_values.std(unbiased=False).item()),
+            }
+        )
+    return summary
+
+
+def _install_first_step_hooks(model: nn.Module) -> tuple[dict[str, Any], list[Any]]:
+    """Capture compact adapter/pooling statistics only for the debug forward."""
+
+    captured: dict[str, Any] = {}
+    handles: list[Any] = []
+    encoder = getattr(model, "encoder", None)
+    layer_norm = getattr(encoder, "layer_norm", None)
+    campp = getattr(encoder, "campp", None)
+    pool = getattr(campp, "pool", None)
+    if isinstance(layer_norm, nn.Module):
+        handles.append(
+            layer_norm.register_forward_pre_hook(
+                lambda _module, inputs: captured.update(
+                    {"layer_norm_input": _tensor_summary(inputs[0])}
+                )
+            )
+        )
+        handles.append(
+            layer_norm.register_forward_hook(
+                lambda _module, _inputs, output: captured.update(
+                    {"layer_norm_output": _tensor_summary(output)}
+                )
+            )
+        )
+    if isinstance(pool, nn.Module):
+        def capture_pool(_module: nn.Module, inputs: tuple[Tensor, ...]) -> None:
+            pool_input = inputs[0].detach().to(torch.float32)
+            variance = pool_input.var(dim=-1, unbiased=False)
+            captured["campp_pool_input"] = _tensor_summary(pool_input)
+            captured["campp_pool_variance_before_clamp"] = _tensor_summary(variance)
+            captured["campp_pool_std_after_clamp"] = _tensor_summary(
+                variance.clamp_min(1e-5).sqrt()
+            )
+
+        handles.append(pool.register_forward_pre_hook(capture_pool))
+    return captured, handles
+
+
+def _first_step_diagnostics(
+    model: nn.Module,
+    output_batch: Any,
+    labels: Tensor,
+    captured: Mapping[str, Any],
+) -> dict[str, Any]:
+    aam_head = getattr(model, "aam_head", None)
+    if aam_head is None or not hasattr(aam_head, "numerical_diagnostics"):
+        raise TrainerError("Model does not expose AAM numerical diagnostics.")
+    tensors = aam_head.numerical_diagnostics(output_batch.raw_embedding, labels)
+    cosine = tensors["cosine"]
+    sine_squared = tensors["sine_squared_before_clamp"]
+    report: dict[str, Any] = {
+        "type": "numerical_diagnostics_before_backward",
+        "raw_embedding": _tensor_summary(output_batch.raw_embedding),
+        "normalized_embedding": _tensor_summary(tensors["normalized_embedding"]),
+        "aam_cosine": _tensor_summary(cosine),
+        "aam_sine_squared_before_clamp": _tensor_summary(sine_squared),
+        "aam_margin_cosine": _tensor_summary(tensors["margin_cosine"]),
+        "aam_logits_before_cross_entropy": _tensor_summary(tensors["logits"]),
+        "final_logits": _tensor_summary(output_batch.logits),
+        "loss": _tensor_summary(output_batch.loss.reshape(1)),
+        "aam_cosine_at_or_beyond_clamp_count": int(
+            (cosine.abs() >= 1.0 - 1e-6).sum().item()
+        ),
+        "aam_sine_squared_at_or_below_floor_count": int(
+            (sine_squared <= 1e-6).sum().item()
+        ),
+    }
+    report.update(captured)
+    return report
 
 
 def prepare_training_data(
@@ -289,6 +388,8 @@ def train_model(
     output_dir: str | Path,
     resume: str | Path | None = None,
     stop_after_steps: int | None = None,
+    detect_anomaly: bool = False,
+    debug_first_step: bool = False,
 ) -> TrainingResult:
     """Run bounded A3 training and always save a resumable ``last.pt``."""
 
@@ -408,13 +509,47 @@ def train_model(
             if epoch == start_epoch and batch_index < start_batch:
                 continue
             waveforms, masks, labels = _move_batch(batch, device)
-            with autocast_context(device, config.training.mixed_precision):
-                output_batch = model(waveforms, labels, attention_mask=masks)
-                loss = output_batch.loss
-                scaled_loss = loss / config.training.gradient_accumulation_steps
-            if not torch.isfinite(loss):
-                raise TrainerError("Training loss is not finite.")
-            scaler.scale(scaled_loss).backward()
+            emit_diagnostics = (
+                (detect_anomaly or debug_first_step)
+                and global_step == 0
+                and accumulation_count == 0
+            )
+            captured: dict[str, Any] = {}
+            handles: list[Any] = []
+            if emit_diagnostics:
+                captured, handles = _install_first_step_hooks(model)
+            anomaly_context = (
+                torch.autograd.detect_anomaly(check_nan=True)
+                if detect_anomaly
+                else nullcontext()
+            )
+            try:
+                # The anomaly context deliberately covers both forward and backward;
+                # otherwise PyTorch cannot report the originating forward operation.
+                with anomaly_context:
+                    with autocast_context(device, config.training.mixed_precision):
+                        output_batch = model(waveforms, labels, attention_mask=masks)
+                        loss = output_batch.loss
+                        scaled_loss = loss / config.training.gradient_accumulation_steps
+                        if emit_diagnostics:
+                            diagnostic_event = _first_step_diagnostics(
+                                model, output_batch, labels, captured
+                            )
+                    if not torch.isfinite(loss):
+                        raise TrainerError("Training loss is not finite.")
+                    if emit_diagnostics:
+                        diagnostic_event.update(
+                            {"epoch": epoch, "pending_step": global_step + 1}
+                        )
+                        _append_history(history_path, diagnostic_event)
+                        print(
+                            json.dumps(diagnostic_event, sort_keys=True),
+                            flush=True,
+                        )
+                    scaler.scale(scaled_loss).backward()
+            finally:
+                for handle in handles:
+                    handle.remove()
             accumulation_count += 1
             accumulation_loss_sum += float(loss.detach().cpu())
             is_last_batch = batch_index + 1 == len(data.fit_loader)

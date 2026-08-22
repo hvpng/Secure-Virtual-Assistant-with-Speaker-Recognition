@@ -31,6 +31,23 @@ def test_aam_backward_reaches_embeddings_and_head():
     assert torch.isfinite(head.weight.grad).all()
 
 
+def test_aam_diagnostics_match_forward_and_keep_sqrt_argument_positive():
+    head = AAMSoftmax(8, 3)
+    embeddings = head.weight.detach().clone().requires_grad_(True)
+    labels = torch.arange(3)
+
+    logits = head(embeddings, labels)
+    diagnostics = head.numerical_diagnostics(embeddings, labels)
+    logits.sum().backward()
+
+    assert torch.equal(logits.detach(), diagnostics["logits"])
+    assert diagnostics["cosine"].max() <= 1.0 - 1e-6
+    assert diagnostics["cosine"].min() >= -1.0 + 1e-6
+    assert diagnostics["sine_squared_before_clamp"].min() > 0
+    assert embeddings.grad is not None
+    assert torch.isfinite(embeddings.grad).all()
+
+
 @pytest.mark.parametrize(
     "labels",
     [torch.tensor([0.0, 1.0]), torch.tensor([0, 3]), torch.tensor([[0], [1]])],
@@ -45,4 +62,3 @@ def test_aam_rejects_non_finite_embeddings():
     embeddings[0, 0] = float("nan")
     with pytest.raises(AAMSoftmaxError, match="NaN"):
         AAMSoftmax(8, 2)(embeddings, torch.tensor([0, 1]))
-

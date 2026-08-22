@@ -37,6 +37,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument(
+        "--detect-anomaly",
+        action="store_true",
+        help=(
+            "Enable slow autograd anomaly tracing around forward/backward; "
+            "also prints first-step numerical diagnostics."
+        ),
+    )
+    parser.add_argument(
+        "--debug-first-step",
+        action="store_true",
+        help="Print compact first-step tensor statistics without anomaly tracing.",
+    )
+    parser.add_argument(
         "--amp",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -138,6 +151,8 @@ def main(argv: list[str] | None = None) -> int:
         device=device,
         output_dir=Path(args.output_dir),
         resume=args.resume,
+        detect_anomaly=args.detect_anomaly,
+        debug_first_step=args.debug_first_step,
     )
     print(json.dumps(result.__dict__, indent=2, sort_keys=True), flush=True)
     return 0
