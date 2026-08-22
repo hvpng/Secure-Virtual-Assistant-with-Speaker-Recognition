@@ -210,8 +210,12 @@ Use `--amp` instead of `--no-amp` only for the corresponding AMP reproduction.
 A4 reconstructs the frozen A3 checkpoint and scores only L2-normalized 192-D encoder
 embeddings. The AAM classifier is loaded only so the checkpoint can be reconstructed
 strictly; it is never used to predict validation or test identities. Embedding
-extraction uses deterministic center crop/repeat-pad, `model.eval()`, `torch.no_grad()`,
-and FP32 by default. Per-split `.npz` caches bind the embeddings to the checkpoint,
+extraction first loads/resamples mono float32 audio to 16 kHz, then evaluates exactly
+one configured 3-second segment: long utterances are center-cropped and short
+utterances are repeat-padded then truncated to 48,000 samples. Exact-length audio is
+unchanged. A4 never uses random crop or zero padding and is not multi-crop or
+full-utterance evaluation. Inference uses `model.eval()`, `torch.no_grad()`, and FP32
+by default. Per-split `.npz` caches bind the embeddings to the checkpoint,
 manifest, evaluation config, dataset root, split, and embedding dimension. An
 incompatible cache fails explicitly unless `--recompute-embeddings` is passed.
 

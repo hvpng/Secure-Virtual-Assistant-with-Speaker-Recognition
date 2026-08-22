@@ -17,6 +17,9 @@ class AudioBatchError(ValueError):
     """Raised when an audio file or waveform cannot meet the model contract."""
 
 
+DETERMINISTIC_SEGMENT_POLICY_VERSION = "deterministic_center_crop_repeat_pad_v1"
+
+
 def _load_pcm16_wav(path: Path) -> tuple[Tensor, int]:
     try:
         with wave.open(str(path), "rb") as audio:
@@ -122,6 +125,25 @@ def fit_waveform_to_segment(waveform: Tensor, segment_samples: int) -> Tensor:
     return waveform.repeat(repeats)[:segment_samples].contiguous()
 
 
+def prepare_deterministic_segment(
+    waveform: Tensor,
+    *,
+    sample_rate: int,
+    segment_seconds: float,
+) -> Tensor:
+    """Create the one fixed evaluation/monitor segment used by A3 and A4.
+
+    The target length is ``round(sample_rate * segment_seconds)``. Long audio is
+    center-cropped, exact-length audio is preserved, and short audio is repeated
+    then truncated. No zero padding or random crop is used.
+    """
+
+    if sample_rate <= 0 or segment_seconds <= 0:
+        raise AudioBatchError("sample_rate and segment_seconds must be positive.")
+    segment_samples = round(sample_rate * segment_seconds)
+    return fit_waveform_to_segment(waveform.to(torch.float32), segment_samples)
+
+
 def fit_waveform_to_segment_random(waveform: Tensor, segment_samples: int) -> Tensor:
     """Random-crop long training audio and preserve A2 repeat-padding for short audio.
 
@@ -155,9 +177,15 @@ def collate_fixed_waveforms(
     items = list(waveforms)
     if not items:
         raise AudioBatchError("Cannot collate an empty waveform batch.")
-    segment_samples = round(sample_rate * segment_seconds)
     batch = torch.stack(
-        [fit_waveform_to_segment(item.to(torch.float32), segment_samples) for item in items]
+        [
+            prepare_deterministic_segment(
+                item,
+                sample_rate=sample_rate,
+                segment_seconds=segment_seconds,
+            )
+            for item in items
+        ]
     )
     attention_mask = torch.ones(batch.shape, dtype=torch.long)
     return batch, attention_mask

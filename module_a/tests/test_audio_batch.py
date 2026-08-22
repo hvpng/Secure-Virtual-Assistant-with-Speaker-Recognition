@@ -16,6 +16,7 @@ from module_a.src.audio_batch import (
     fit_waveform_to_segment,
     fit_waveform_to_segment_random,
     load_waveform,
+    prepare_deterministic_segment,
 )
 
 
@@ -124,6 +125,50 @@ def test_fixed_collator_center_crops_and_repeat_pads_deterministically():
     assert mask.shape == batch.shape
     assert torch.all(mask == 1)
     assert torch.equal(fit_waveform_to_segment(short, 4), batch[0])
+
+
+def test_deterministic_segment_repeat_pads_short_audio_without_zeros():
+    waveform = torch.tensor([1.0, 2.0, 3.0])
+    segment = prepare_deterministic_segment(
+        waveform, sample_rate=4, segment_seconds=2.0
+    )
+
+    assert segment.shape == (8,)
+    assert torch.equal(segment, torch.tensor([1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0]))
+    assert not torch.any(segment == 0)
+
+
+def test_deterministic_segment_preserves_exact_length_audio():
+    waveform = torch.arange(8, dtype=torch.float32)
+
+    segment = prepare_deterministic_segment(
+        waveform, sample_rate=4, segment_seconds=2.0
+    )
+
+    assert torch.equal(segment, waveform)
+
+
+def test_deterministic_segment_center_crops_long_audio():
+    waveform = torch.arange(12, dtype=torch.float32)
+
+    segment = prepare_deterministic_segment(
+        waveform, sample_rate=4, segment_seconds=2.0
+    )
+
+    assert torch.equal(segment, waveform[2:10])
+
+
+def test_deterministic_segment_is_repeatable():
+    waveform = torch.arange(13, dtype=torch.float32)
+
+    first = prepare_deterministic_segment(
+        waveform, sample_rate=4, segment_seconds=2.0
+    )
+    second = prepare_deterministic_segment(
+        waveform, sample_rate=4, segment_seconds=2.0
+    )
+
+    assert torch.equal(first, second)
 
 
 def test_audio_batch_rejects_invalid_rank_and_nan():

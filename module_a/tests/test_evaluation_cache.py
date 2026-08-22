@@ -7,11 +7,14 @@ import pytest
 import torch
 from torch import nn
 
+from module_a.src import evaluation as evaluation_module
 from module_a.src.checkpoint import save_checkpoint
 from module_a.src.config import config_to_dict
 from module_a.src.evaluation import (
     EvaluationError,
     EvaluationModelBundle,
+    EMBEDDING_PREPROCESSING_VERSION,
+    extract_embeddings,
     get_or_create_embedding_cache,
     load_evaluation_model,
     validate_embedding_vector,
@@ -89,6 +92,85 @@ def test_embedding_cache_rejects_checkpoint_incompatibility(tmp_path, small_mode
             split="val",
             dataset_root=tmp_path,
         )
+
+
+def test_embedding_cache_fingerprint_changes_with_preprocessing_version(
+    tmp_path, small_model_config, monkeypatch
+):
+    records = [TrainingRecord("val/a.wav", "val_a", "val")]
+    path = tmp_path / "embeddings.npz"
+    cache = get_or_create_embedding_cache(
+        path,
+        bundle=_bundle(tmp_path, small_model_config),
+        records=records,
+        split="val",
+        dataset_root=tmp_path,
+        extractor=lambda: {"val/a.wav": _unit(0)},
+    )
+    assert cache.metadata["schema_version"] == 2
+    assert cache.metadata["embedding_preprocessing"] == EMBEDDING_PREPROCESSING_VERSION
+
+    monkeypatch.setattr(
+        evaluation_module,
+        "EMBEDDING_PREPROCESSING_VERSION",
+        "deterministic_center_crop_repeat_pad_v2",
+    )
+    with pytest.raises(EvaluationError, match="recompute-embeddings"):
+        get_or_create_embedding_cache(
+            path,
+            bundle=_bundle(tmp_path, small_model_config),
+            records=records,
+            split="val",
+            dataset_root=tmp_path,
+        )
+
+
+def test_extract_embeddings_applies_fixed_segment_before_model_call(
+    tmp_path, small_model_config, monkeypatch
+):
+    class CapturingModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.waveforms = None
+            self.attention_mask = None
+            self.grad_enabled = None
+
+        def extract_embedding(self, waveforms, attention_mask=None):
+            self.waveforms = waveforms.detach().cpu().clone()
+            self.attention_mask = attention_mask.detach().cpu().clone()
+            self.grad_enabled = torch.is_grad_enabled()
+            output = torch.zeros((waveforms.shape[0], 192), device=waveforms.device)
+            output[:, 0] = 1.0
+            return output
+
+    config = replace(
+        small_model_config,
+        audio=replace(
+            small_model_config.audio,
+            target_sample_rate=4,
+            segment_seconds=1.0,
+        ),
+        evaluation=replace(small_model_config.evaluation, embedding_batch_size=1),
+    )
+    model = CapturingModel()
+    bundle = replace(_bundle(tmp_path, config), model=model)
+    monkeypatch.setattr(
+        evaluation_module,
+        "load_waveform",
+        lambda *_args, **_kwargs: torch.tensor([1.0, 2.0, 3.0]),
+    )
+
+    embeddings = extract_embeddings(
+        bundle,
+        [TrainingRecord("val/short.wav", "val_a", "val")],
+        dataset_root=tmp_path,
+    )
+
+    assert torch.equal(model.waveforms, torch.tensor([[1.0, 2.0, 3.0, 1.0]]))
+    assert torch.all(model.attention_mask == 1)
+    assert model.grad_enabled is False
+    assert model.training is False
+    assert embeddings["val/short.wav"].shape == (192,)
 
 
 @pytest.mark.parametrize(

@@ -14,7 +14,11 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from module_a.src.audio_batch import collate_fixed_waveforms, load_waveform
+from module_a.src.audio_batch import (
+    DETERMINISTIC_SEGMENT_POLICY_VERSION,
+    load_waveform,
+    prepare_deterministic_segment,
+)
 from module_a.src.checkpoint import CHECKPOINT_FIELDS
 from module_a.src.config import ModuleAConfig, config_to_dict, load_config
 from module_a.src.device import autocast_context
@@ -24,6 +28,9 @@ from module_a.src.training_data import TrainingRecord, load_manifest
 
 class EvaluationError(RuntimeError):
     """Raised when A4 data, checkpoint, cache, or inference is unsafe."""
+
+
+EMBEDDING_PREPROCESSING_VERSION = DETERMINISTIC_SEGMENT_POLICY_VERSION
 
 
 @dataclass(frozen=True)
@@ -106,6 +113,7 @@ def fingerprint_evaluation_config(config: ModuleAConfig) -> str:
         "audio": serialized["audio"],
         "loss": serialized["loss"],
         "evaluation_mixed_precision": serialized["evaluation"]["mixed_precision"],
+        "embedding_preprocessing": EMBEDDING_PREPROCESSING_VERSION,
     }
     return hashlib.sha256(
         json.dumps(relevant, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -285,10 +293,18 @@ def extract_embeddings(
                     )
                 except Exception as exc:
                     raise EvaluationError(f"Cannot load evaluation audio: {record.path}") from exc
-            waveform_batch, attention_mask = collate_fixed_waveforms(
-                waveforms,
-                sample_rate=bundle.config.audio.target_sample_rate,
-                segment_seconds=bundle.config.audio.segment_seconds,
+            segments = [
+                prepare_deterministic_segment(
+                    waveform,
+                    sample_rate=bundle.config.audio.target_sample_rate,
+                    segment_seconds=bundle.config.audio.segment_seconds,
+                )
+                for waveform in waveforms
+            ]
+            waveform_batch = torch.stack(segments)
+            attention_mask = torch.ones(
+                waveform_batch.shape,
+                dtype=torch.long,
             )
             waveform_batch = waveform_batch.to(bundle.device)
             attention_mask = attention_mask.to(bundle.device)
@@ -321,7 +337,8 @@ def _cache_metadata(
     dataset_root: str | Path,
 ) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "embedding_preprocessing": EMBEDDING_PREPROCESSING_VERSION,
         "split": split,
         "embedding_dimension": bundle.config.model.embedding_dimension,
         "checkpoint_sha256": bundle.checkpoint_sha256,
