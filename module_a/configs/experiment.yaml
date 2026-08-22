@@ -36,6 +36,8 @@ training:
   # --max-steps so invoking it cannot accidentally launch an unbounded run.
   max_steps: null
   mixed_precision: true
+  # Monitor loss favors numerical robustness over throughput.
+  monitor_mixed_precision: false
   # Engineering starting points only; these are not tuned hyperparameters.
   learning_rate: 0.001
   weight_decay: 0.0001

@@ -307,9 +307,9 @@ def validate_monitor_loss(
     loader: DataLoader,
     *,
     device: torch.device,
-    amp_enabled: bool,
+    mixed_precision: bool = False,
 ) -> float:
-    """Compute AAM loss only for held-out utterances of train classifier speakers."""
+    """Compute train-speaker holdout AAM loss in FP32 unless explicitly opted in."""
 
     was_training = model.training
     model.eval()
@@ -318,7 +318,7 @@ def validate_monitor_loss(
     with torch.no_grad():
         for batch in loader:
             waveforms, masks, labels = _move_batch(batch, device)
-            with autocast_context(device, amp_enabled):
+            with autocast_context(device, mixed_precision):
                 output = model(waveforms, labels, attention_mask=masks)
             loss = float(output.loss.detach().cpu())
             if not math.isfinite(loss):
@@ -337,6 +337,52 @@ def _assert_finite_gradients(model: nn.Module) -> None:
     for name, parameter in model.named_parameters():
         if parameter.grad is not None and not torch.isfinite(parameter.grad).all():
             raise TrainerError(f"Non-finite gradient detected in: {name}")
+
+
+def _non_finite_trainable_parameters(model: nn.Module) -> tuple[str, ...]:
+    return tuple(
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and not torch.isfinite(parameter).all()
+    )
+
+
+def inspect_non_finite_model_state(model: nn.Module) -> dict[str, tuple[str, ...]]:
+    """Identify corrupt trainable parameters and BatchNorm running statistics."""
+
+    running_means: list[str] = []
+    running_variances: list[str] = []
+    batch_norm_types = (
+        nn.BatchNorm1d,
+        nn.BatchNorm2d,
+        nn.BatchNorm3d,
+        nn.SyncBatchNorm,
+    )
+    for module_name, module in model.named_modules():
+        if not isinstance(module, batch_norm_types):
+            continue
+        prefix = f"{module_name}." if module_name else ""
+        if module.running_mean is not None and not torch.isfinite(
+            module.running_mean
+        ).all():
+            running_means.append(f"{prefix}running_mean")
+        if module.running_var is not None and not torch.isfinite(
+            module.running_var
+        ).all():
+            running_variances.append(f"{prefix}running_var")
+    return {
+        "trainable_parameters": _non_finite_trainable_parameters(model),
+        "batchnorm_running_mean": tuple(running_means),
+        "batchnorm_running_var": tuple(running_variances),
+    }
+
+
+def _assert_finite_trainable_parameters(model: nn.Module) -> None:
+    corrupt = _non_finite_trainable_parameters(model)
+    if corrupt:
+        raise TrainerError(
+            f"Non-finite trainable parameter detected after optimizer step: {corrupt[0]}"
+        )
 
 
 def _apply_optimizer_update(
@@ -365,6 +411,7 @@ def _apply_optimizer_update(
         optimizer.zero_grad(set_to_none=True)
         succeeded = new_scale >= old_scale
         if succeeded:
+            _assert_finite_trainable_parameters(model)
             scheduler.step()
         return OptimizerUpdateResult(
             succeeded=succeeded,
@@ -375,6 +422,7 @@ def _apply_optimizer_update(
     _assert_finite_gradients(model)
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
+    _assert_finite_trainable_parameters(model)
     scheduler.step()
     return OptimizerUpdateResult(succeeded=True, old_scale=None, new_scale=None)
 
@@ -682,7 +730,7 @@ def train_model(
                     model,
                     data.monitor_loader,
                     device=device,
-                    amp_enabled=amp_enabled,
+                    mixed_precision=config.training.monitor_mixed_precision,
                 )
                 best_monitor_loss = min(best_monitor_loss, final_monitor_loss)
                 _append_history(
@@ -740,7 +788,7 @@ def train_model(
         model,
         data.monitor_loader,
         device=device,
-        amp_enabled=amp_enabled,
+        mixed_precision=config.training.monitor_mixed_precision,
     )
     best_monitor_loss = min(best_monitor_loss, final_monitor_loss)
     _append_history(

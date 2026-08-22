@@ -80,6 +80,7 @@ class TrainingConfig:
     epochs: int
     max_steps: int | None
     mixed_precision: bool
+    monitor_mixed_precision: bool
     learning_rate: float
     weight_decay: float
     speakers_per_batch: int
@@ -424,6 +425,10 @@ def load_config(
             ),
             mixed_precision=_boolean(
                 training_data.get("mixed_precision"), "training.mixed_precision"
+            ),
+            monitor_mixed_precision=_boolean(
+                training_data.get("monitor_mixed_precision", False),
+                "training.monitor_mixed_precision",
             ),
             learning_rate=_positive_number(
                 training_data.get("learning_rate"), "training.learning_rate"

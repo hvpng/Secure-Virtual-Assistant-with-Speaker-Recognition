@@ -133,6 +133,9 @@ CPU disables AMP safely. A finite-loss CUDA FP16 gradient overflow is skipped by
 GradScaler, logged as `amp_overflow`, and retried at a lower scale without advancing
 the scheduler or global optimizer step. Twenty consecutive overflows abort the run.
 Non-finite forward losses remain fatal; FP32 non-finite gradients also remain fatal.
+After every successful update, all trainable parameters are checked for finite values.
+Stage-1 training may use AMP, but A3 monitor loss runs in FP32 by default
+(`monitor_mixed_precision: false`) for numerical robustness.
 
 The real-data CLI refuses to train unless `--mini` or an explicit `--max-steps` is
 provided. A Kaggle 50-speaker/50-step smoke command is:

@@ -5,8 +5,10 @@ import json
 import math
 import subprocess
 import sys
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -18,9 +20,12 @@ from module_a.src.model_factory import build_model, build_optimizer, build_sched
 from module_a.src.models.wavlm_frontend import DeterministicFakeWavLM
 from module_a.src.trainer import (
     TrainerError,
+    _apply_optimizer_update,
     create_grad_scaler,
+    inspect_non_finite_model_state,
     prepare_training_data,
     train_model,
+    validate_monitor_loss,
 )
 
 
@@ -82,6 +87,26 @@ class CountingScheduler:
 
     def load_state_dict(self, state):
         self.step_calls = int(state["step_calls"])
+
+
+class PrecisionSensitiveMonitorModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.tensor(0.0))
+        self.simulate_fp16 = False
+
+    def forward(self, waveforms, labels, *, attention_mask=None):
+        del waveforms, labels, attention_mask
+        value = float("inf") if self.simulate_fp16 else 1.25
+        return SimpleNamespace(loss=self.anchor * 0 + value)
+
+
+class CorruptingSGD(torch.optim.SGD):
+    def step(self, closure=None):
+        result = super().step(closure)
+        with torch.no_grad():
+            self.param_groups[0]["params"][0].fill_(float("inf"))
+        return result
 
 
 def _history_events(path: Path) -> list[dict[str, object]]:
@@ -197,6 +222,131 @@ def test_cpu_one_step_changes_backend_not_frozen_frontend_and_writes_outputs(
     ):
         assert (tmp_path / "run" / filename).is_file()
     assert Path(result.checkpoint_path).is_file()
+
+
+def test_training_amp_does_not_enable_monitor_autocast(
+    tmp_path, write_wav, small_model_config, monkeypatch
+):
+    config, data = build_training_fixture(
+        tmp_path, write_wav, small_model_config, max_steps=1
+    )
+    assert config.training.mixed_precision is True
+    assert config.training.monitor_mixed_precision is False
+    scaler = FakeGradScaler([False])
+    scheduler = CountingScheduler()
+    _install_fake_amp(monkeypatch, scaler, scheduler)
+    precision_calls: list[bool] = []
+
+    @contextmanager
+    def tracked_autocast(_device, enabled):
+        precision_calls.append(enabled)
+        yield
+
+    monkeypatch.setattr(trainer_module, "autocast_context", tracked_autocast)
+
+    result = train_model(
+        model=new_model(config, len(data.speaker_to_index)),
+        config=config,
+        data=data,
+        device=torch.device("cpu"),
+        output_dir=tmp_path / "run",
+    )
+
+    assert result.global_step == 1
+    assert precision_calls[0] is True
+    assert precision_calls[-1] is False
+
+
+def test_monitor_fp32_default_avoids_fake_fp16_overflow(monkeypatch):
+    model = PrecisionSensitiveMonitorModel()
+    model.train()
+    batch = {
+        "waveforms": torch.ones(2, 8),
+        "attention_mask": torch.ones(2, 8, dtype=torch.long),
+        "labels": torch.tensor([0, 1]),
+    }
+    precision_calls: list[bool] = []
+
+    @contextmanager
+    def simulated_autocast(_device, enabled):
+        precision_calls.append(enabled)
+        model.simulate_fp16 = enabled
+        try:
+            yield
+        finally:
+            model.simulate_fp16 = False
+
+    monkeypatch.setattr(trainer_module, "autocast_context", simulated_autocast)
+
+    loss = validate_monitor_loss(model, [batch], device=torch.device("cpu"))
+
+    assert loss == pytest.approx(1.25)
+    assert precision_calls == [False]
+    assert model.training is True
+    with pytest.raises(TrainerError, match="Monitor loss is not finite"):
+        validate_monitor_loss(
+            model,
+            [batch],
+            device=torch.device("cpu"),
+            mixed_precision=True,
+        )
+
+
+def test_successful_optimizer_update_keeps_parameters_finite():
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = CountingScheduler()
+    model(torch.ones(1, 2)).sum().backward()
+
+    result = _apply_optimizer_update(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=None,
+        amp_enabled=False,
+    )
+
+    assert result.succeeded is True
+    assert inspect_non_finite_model_state(model)["trainable_parameters"] == ()
+    assert scheduler.step_calls == 1
+
+
+def test_non_finite_parameter_after_successful_amp_step_is_detected():
+    model = torch.nn.Linear(2, 1)
+    optimizer = CorruptingSGD(model.parameters(), lr=0.1)
+    scheduler = CountingScheduler()
+    scaler = FakeGradScaler([False])
+    model(torch.ones(1, 2)).sum().backward()
+
+    with pytest.raises(
+        TrainerError, match="Non-finite trainable parameter.*weight"
+    ):
+        _apply_optimizer_update(
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            amp_enabled=True,
+        )
+
+    assert scaler.optimizer_step_calls == 1
+    assert scheduler.step_calls == 0
+
+
+def test_model_state_diagnostics_identify_batchnorm_buffers_and_parameters():
+    model = torch.nn.Sequential(torch.nn.BatchNorm1d(2), torch.nn.Linear(2, 1))
+    with torch.no_grad():
+        model[0].running_mean[0] = float("inf")
+        model[0].running_var[1] = float("nan")
+        model[1].weight[0, 0] = float("inf")
+
+    diagnostics = inspect_non_finite_model_state(model)
+
+    assert diagnostics == {
+        "trainable_parameters": ("1.weight",),
+        "batchnorm_running_mean": ("0.running_mean",),
+        "batchnorm_running_var": ("0.running_var",),
+    }
 
 
 def test_fp32_non_finite_gradient_remains_fatal(
