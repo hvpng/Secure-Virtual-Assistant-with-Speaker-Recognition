@@ -18,6 +18,7 @@ module_a/outputs/*
 !module_a/outputs/.gitkeep
 module_a/data/
 module_a/checkpoints/
+module_a/.cache/
 module_a/**/.ipynb_checkpoints/
 /module_a_a4/
 

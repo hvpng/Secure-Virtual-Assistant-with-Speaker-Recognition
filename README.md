@@ -1,6 +1,6 @@
 # Secure Virtual Assistant with Speaker Recognition
 
-This repository contains Module B, the local application for the Secure IT Helpdesk Voice Assistant. Module A trains and exports the speaker model separately on Kaggle. M0 provides project structure, configuration, and a health-check connection between the frontend and backend only.
+This repository contains Module B, the local application for the Secure IT Helpdesk Voice Assistant. Module A trains an ECAPA-TDNN speaker encoder on VoxVietnam separately on Kaggle and exports one shared 192-D embedding model for SV and SID. M0 provides project structure, configuration, and a health-check connection between the frontend and backend only.
 
 ## Prerequisites
 
@@ -54,7 +54,7 @@ mono, 16 kHz, 16-bit PCM WAV. Browser `.webm` decoding requires `ffmpeg` on
 the speaker service already follows this contract.
 
 M1 uses `SPEAKER_BACKEND=fake` for deterministic local development and unit
-tests. Set `SPEAKER_BACKEND=real` only after Module A replaces
+tests. Set `SPEAKER_BACKEND=real` only after the ECAPA Module A export is integrated into
 `backend/app/models/speaker_model.py` with the real artifact. There is no silent
 fallback from real to fake. The checked-in speaker and enrollment JSON configs
 contain development-only thresholds and must be replaced by Module A's
@@ -155,3 +155,6 @@ npm run build
 ## Module boundaries
 
 M0 contains no speaker inference, ASR/TTS, Gemini function calling, business database schema, enrollment flow, or voice chat implementation. Speaker artifacts are produced by Module A and integrated in later modules.
+
+The Kaggle ECAPA/VoxVietnam training, validation calibration, final VoxVietnam-O
+evaluation, and export workflow is documented in `module_a/README.md`.

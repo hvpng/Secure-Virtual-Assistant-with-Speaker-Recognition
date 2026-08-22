@@ -1,0 +1,68 @@
+seed: 42
+
+dataset:
+  name: VoxVietnam
+  hf_repo_id: hustep-lab/VoxVietnam-Dataset
+  train_subset: VoxVietnam-T
+  test_subset: VoxVietnam-O
+  audio_extensions: [.wav, .flac]
+  speaker_id_component_from_end: 2
+  train_ratio: 0.9
+  validation_ratio: 0.1
+
+audio:
+  sample_rate: 16000
+  segment_seconds: 3.0
+
+features:
+  fbank_dim: 80
+  frame_length_ms: 25.0
+  frame_shift_ms: 10.0
+  n_fft: 512
+
+model:
+  architecture: ecapa_tdnn
+  channels: 512
+  scale: 8
+  se_channels: 128
+  embedding_dim: 192
+
+loss:
+  name: aam_softmax
+  margin: 0.2
+  scale: 30.0
+
+optimizer:
+  name: adamw
+  learning_rate: 0.001
+  weight_decay: 0.0001
+
+training:
+  epochs: 20
+  batch_size: 32
+  speakers_per_batch: 16
+  utterances_per_speaker: 2
+  gradient_accumulation: 2
+  amp: true
+  num_workers: 2
+  validate_every_epochs: 1
+  max_positive_trials_per_speaker: 20
+
+augmentation:
+  speed_perturb: true
+  additive_noise: true
+  reverb: true
+  noise_dir: null
+  reverb_dir: null
+
+calibration:
+  sv_target_far: 0.05
+  sid_target_unknown_far: 0.05
+  sid_known_ratio: 0.8
+  sid_max_enrollment: 5
+
+evaluation:
+  batch_size: 32
+  official_trials: null
+  sv_protocol: auto
+

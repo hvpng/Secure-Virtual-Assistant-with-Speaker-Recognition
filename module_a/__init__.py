@@ -1,2 +1,2 @@
-"""Module A research workspace for speaker-model preparation."""
+"""ECAPA-TDNN research pipeline for VoxVietnam."""
 

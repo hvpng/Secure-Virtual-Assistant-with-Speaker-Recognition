@@ -1,428 +1,196 @@
-# Module A — Speaker Recognition Research Workspace
+# Module A — ECAPA-TDNN on VoxVietnam
 
-Module A runs separately from the FastAPI/React application. It prepares, trains,
-evaluates, calibrates, and eventually exports the speaker model consumed by Track B.
-The current implementation stops at A4. It contains Stage-1 training infrastructure
-and reproducible SV/SID evaluation with validation-only calibration. Real A4 metric
-values are intentionally not claimed until the frozen Kaggle checkpoint is evaluated.
-
-## Milestones
-
-- A0: structure, lightweight configuration, reproducibility, and stable contracts — implemented.
-- A1: dataset discovery, audio metadata, eligibility filtering, speaker-disjoint manifests — implemented.
-- A2: WavLM/CAM++/AAM forward, backward, optimizer, and checkpoint sanity — implemented.
-- A3: train-manifest dataset, balanced mini-training, monitoring, and resume — implemented.
-- A4: SV/SID evaluation and validation-only calibration — implemented.
-- A5: export and local Track B ABI smoke — not implemented.
-
-## Environment
-
-Python 3.11+ is required. WAV inspection uses only the standard library. FLAC, MP3,
-and M4A header inspection uses `ffprobe`, normally installed with ffmpeg.
-
-```bash
-python -m venv .venv-module-a
-.venv-module-a/Scripts/python -m pip install -r module_a/requirements.txt
-```
-
-On Linux/Kaggle use `.venv-module-a/bin/python` if creating a virtual environment.
-Kaggle images usually already include PyTorch and ffmpeg. A0/A1 and default tests do
-not download a model. Only the explicit real A2 smoke command may download WavLM.
-
-## A2 architecture sanity
-
-The frozen Stage-1 graph is:
+Module A is the Kaggle research workspace for one speaker encoder:
 
 ```text
-float32 waveform [B, samples] at 16 kHz
-  -> microsoft/wavlm-base-plus final hidden state [B, frames, 768]
-  -> LayerNorm(768)
-  -> team engineering adapter Linear(768, 80) [B, frames, 80]
-  -> explicit transpose [B, 80, frames]
-  -> CAM++
-  -> raw speaker embedding [B, 192]
-  -> AAM-Softmax head during training
+16 kHz mono waveform
+→ 80-bin log-Mel filterbank
+→ per-utterance mean normalization
+→ ECAPA-TDNN
+→ 192-D L2-normalized embedding
 ```
 
-Inference uses L2-normalized embeddings. AAM-Softmax normalizes embeddings and class
-weights internally, then applies margin `0.2` and scale `30.0`. `num_classes` is a
-factory argument; A2 only uses synthetic labels. A3 must derive its mapping from train
-speakers only.
+The same encoder supports speaker verification (SV) and open-set speaker
+identification (SID). AAM-Softmax is training-only and is not exported.
 
-All WavLM parameters are frozen and the frontend remains in eval mode even while the
-trainable adapter/CAM++/AAM path is in training mode. `stage2_enabled` is present only
-as an explicit future gate and must remain false in A2.
+## Two-phase workflow
 
-Waveform collation uses deterministic center cropping and repeat-padding to the
-configured 3-second segment. Repeat-padding ensures CAM++ statistics pooling does not
-silently include zero padding. PCM16 WAV loading is implemented without an optional
-torchaudio decoder backend; other formats use torchaudio when its runtime backend is
-available.
-
-### CAM++ source and adaptation status
-
-The implementation is a local, non-verbatim reimplementation informed by:
-
-- Wang et al., [CAM++: A Fast and Efficient Network for Speaker Verification Using
-  Context-Aware Masking](https://arxiv.org/abs/2303.00332), Interspeech 2023.
-- The Apache-2.0 [ModelScope/3D-Speaker CAM++
-  implementation](https://github.com/modelscope/3D-Speaker/tree/main/speakerlab/models/campplus).
-
-It retains the paper's frequency convolution module, densely connected TDNN backbone,
-per-layer context-aware masks, global plus fixed-segment context, transition layers,
-and statistics pooling. The integration differs from the original Fbank recipe because
-the team's explicit WavLM adapter supplies 80-D frame features. The implementation is
-not claimed to be an official CAM++ release or an exact reproduction of published
-performance.
-
-Within each dense layer, the second `BatchNorm1d -> ReLU` output is the shared input
-to both the local TDNN convolution and the context-aware mask, matching the referenced
-CAM++ data flow. Checkpoints trained before this correction fed the unnormalized
-bottleneck tensor to the sigmoid mask; this could create near-constant dense growth
-channels and degenerate downstream bottleneck running variances. Such checkpoints
-must not be used for A4 calibration/export and require retraining from initialization.
-`python -m module_a.scripts.diagnose_campp_checkpoint --help` documents the read-only
-BN-state and known-utterance diagnostic command.
-
-Production-size config uses CAM++ block depths `12/24/16`, growth rate 32, and a 192-D
-embedding. Offline tests and `sanity_model` inject a smaller topology while preserving
-all tensor contracts so CPU tests stay fast. The real smoke uses production-size config.
-
-### A2 commands
+Phase 1 uses only VoxVietnam-T. It creates a deterministic 90/10 speaker-disjoint
+split with seed 42, trains ECAPA using speaker-balanced batches, selects `best.pt`
+by validation SV EER, and calibrates both deployment thresholds on validation.
 
 ```bash
-pytest module_a/tests -q
-python -m module_a.scripts.sanity_model
-python -m module_a.scripts.smoke_model --help
-python -m module_a.scripts.smoke_model --device auto
+python -m module_a.scripts.train_ecapa \
+  --dataset-root /path/to/VoxVietnam-or-VoxVietnam-T \
+  --output-dir /path/to/outputs \
+  --device auto
 ```
 
-`sanity_model` injects a deterministic fake WavLM and never downloads weights. It runs
-one forward/backward/optimizer step and a temporary checkpoint roundtrip. `smoke_model`
-is the separate real Hugging Face integration check; it defaults to one short waveform,
-batch size one, frozen WavLM, and no optimizer.
-
-The atomic checkpoint contract stores `model_state_dict`, `optimizer_state_dict`,
-`epoch`, `step`, the full serialized config, `num_classes`, and the train-speaker-only
-`speaker_to_index` mapping. It stores model tensors, not a Hugging Face cache directory.
-
-A2 proves model-graph correctness only. A3 adds bounded training infrastructure but
-does not claim a completed Vietnam-Celeb training result. EER, SID evaluation, and all
-thresholds belong to A4; production Track B export belongs to A5.
-
-## A3 mini-training
-
-The AAM classifier is built exclusively from sorted speaker IDs in the A1 **train**
-manifest. A1 validation and test speakers never enter `speaker_to_index` and are not
-used for AAM classification loss. They remain reserved for A4 embedding-based SV/SID
-evaluation and validation-only calibration.
-
-A3 creates a deterministic internal monitor holdout from train-manifest utterances:
-
-- selected train speakers define all classifier classes;
-- monitor speakers are a deterministic subset of those same classifier speakers;
-- for each monitor speaker, `floor(utterances * monitor_holdout_ratio)` samples are
-  held out, with a minimum of one monitor utterance and at least one fit utterance left;
-- one-utterance speakers remain in fit data and cannot enter the monitor subset;
-- fit and monitor paths are disjoint;
-- monitor audio uses deterministic center crop/repeat-pad, while fit audio uses seeded
-  random crop and the same repeat-padding policy for short files.
-
-Training uses a speaker-balanced batch sampler. Each batch first chooses
-`speakers_per_batch` distinct speakers uniformly, then chooses
-`utterances_per_speaker` samples uniformly for each speaker. A low-resource speaker is
-sampled with replacement only when it has too few fit utterances. The sequence is
-deterministic for the same seed and sampler epoch, so high-resource speakers do not
-dominate merely because they have more files.
-
-The Stage-1 optimizer remains AdamW over trainable adapter/CAM++/AAM parameters only;
-WavLM is frozen and excluded. The scheduler is per-update warmup plus cosine decay.
-CUDA uses `torch.autocast` and `torch.amp.GradScaler` when `mixed_precision: true`;
-CPU disables AMP safely. A finite-loss CUDA FP16 gradient overflow is skipped by
-GradScaler, logged as `amp_overflow`, and retried at a lower scale without advancing
-the scheduler or global optimizer step. Twenty consecutive overflows abort the run.
-Non-finite forward losses remain fatal; FP32 non-finite gradients also remain fatal.
-After every successful update, all trainable parameters are checked for finite values.
-Stage-1 training may use AMP, but A3 monitor loss runs in FP32 by default
-(`monitor_mixed_precision: false`) for numerical robustness.
-
-The real-data CLI refuses to train unless `--mini` or an explicit `--max-steps` is
-provided. A Kaggle 50-speaker/50-step smoke command is:
+Phase 2 first validates the persisted calibration against `best.pt`, then and only
+then opens VoxVietnam-O. It never recalibrates on final test data.
 
 ```bash
-python -m module_a.scripts.train_model \
-  --dataset-root /kaggle/input/datasets/davidthomastran/vietnam-celeb-dataset/full-dataset/data \
-  --train-manifest /kaggle/working/module-a-outputs/train_manifest.csv \
-  --output-dir /kaggle/working/module-a-a3-mini \
-  --device cuda \
-  --mini \
-  --max-steps 50 \
-  --max-train-speakers 50 \
-  --max-monitor-speakers 10 \
-  --speakers-per-batch 8 \
-  --utterances-per-speaker 2 \
-  --num-workers 2 \
-  --amp
+python -m module_a.scripts.evaluate_export \
+  --dataset-root /path/to/VoxVietnam-or-VoxVietnam-O \
+  --output-dir /path/to/outputs \
+  --device auto \
+  --sv-protocol auto
 ```
 
-Adjust only the manifest path if A1 outputs were written elsewhere. Resume with the
-same data/config/limits and add:
+If `--dataset-root` is omitted, both scripts use the configured Hugging Face source
+`hustep-lab/VoxVietnam-Dataset`. Put a gated-dataset token in `HF_TOKEN`; do not put
+tokens in YAML or source control. Phase 1 restricts the snapshot patterns to
+VoxVietnam-T, while Phase 2 requests VoxVietnam-O.
 
-```bash
---resume /kaggle/working/module-a-a3-mini/checkpoints/last.pt
-```
+`--sv-protocol auto` uses one unambiguous trial file found under VoxVietnam-O. If no
+trial list is present it runs a clearly labeled custom balanced protocol. Use
+`--sv-protocol official --official-trials /path/to/trials.txt` to require a supplied
+official protocol. The official file schema/path coverage must be verified on Kaggle;
+custom results must not be presented as comparable to the published benchmark.
 
-The run writes `checkpoints/last.pt`, optional step checkpoints, `history.jsonl`,
-`run_config.json`, `speaker_to_index.json`, `train_monitor_split.json`, and
-`training_summary.json` under the untracked output directory. Resume restores model,
-optimizer, scheduler, AMP scaler, epoch/step cursor, and rejects an incompatible
-classifier mapping.
+## Configuration and outputs
 
-Offline A3 verification uses fake WavLM and downloads nothing:
+All defaults are in `configs/ecapa_voxvietnam.yaml`: feature dimensions, ECAPA size,
+AAM margin/scale, AdamW settings, augmentation, sampling, and calibration targets.
+Noise and reverb are enabled only when their configured resource directories contain
+usable WAV/FLAC files. `training_summary.json` records what was actually enabled.
 
-```bash
-python -m module_a.scripts.train_model --help
-python -m module_a.scripts.sanity_train
-```
-
-### Non-finite backward diagnostics
-
-Anomaly tracing is opt-in because it is intentionally slow. `--detect-anomaly` wraps
-both the forward and backward pass with `torch.autograd.detect_anomaly(check_nan=True)`
-so PyTorch can report the forward operation whose backward first emits NaN/Inf. It
-also prints compact first-batch statistics; `--debug-first-step` prints the same
-statistics without enabling anomaly tracing. Neither flag changes the default run.
-
-One real non-AMP batch on Kaggle:
-
-```bash
-python -m module_a.scripts.train_model \
-  --dataset-root /kaggle/input/datasets/davidthomastran/vietnam-celeb-dataset/full-dataset/data \
-  --train-manifest /kaggle/working/module-a-outputs/train_manifest.csv \
-  --output-dir /kaggle/working/module-a-a3-anomaly \
-  --device cuda \
-  --mini \
-  --max-steps 1 \
-  --max-train-speakers 50 \
-  --max-monitor-speakers 10 \
-  --speakers-per-batch 8 \
-  --utterances-per-speaker 2 \
-  --num-workers 2 \
-  --no-amp \
-  --detect-anomaly
-```
-
-Use `--amp` instead of `--no-amp` only for the corresponding AMP reproduction.
-
-## A4 speaker-disjoint evaluation
-
-A4 reconstructs the frozen A3 checkpoint and scores only L2-normalized 192-D encoder
-embeddings. The AAM classifier is loaded only so the checkpoint can be reconstructed
-strictly; it is never used to predict validation or test identities. Embedding
-extraction first loads/resamples mono float32 audio to 16 kHz, then evaluates exactly
-one configured 3-second segment: long utterances are center-cropped and short
-utterances are repeat-padded then truncated to 48,000 samples. Exact-length audio is
-unchanged. A4 never uses random crop or zero padding and is not multi-crop or
-full-utterance evaluation. Inference uses `model.eval()`, `torch.no_grad()`, and FP32
-by default. Per-split `.npz` caches bind the embeddings to the checkpoint,
-manifest, evaluation config, dataset root, split, and embedding dimension. An
-incompatible cache fails explicitly unless `--recompute-embeddings` is passed.
-
-SV uses bounded same-speaker unordered pairs with no self-pairs. Each speaker gets at
-most `max_sv_positive_per_speaker` deterministic positive trials. The protocol then
-samples an equal number of unique different-speaker negative pairs using seed 42.
-Cosine similarity is the dot product of normalized embeddings. EER is the average of
-FAR and FRR at the empirical score threshold minimizing `abs(FAR - FRR)`; it is not
-interpolated, and equal objectives prefer the higher threshold. EER and its threshold
-remain intrinsic model metrics. Separately, validation chooses the deployment SV
-threshold from empirical candidates (including a reject-all sentinel): among points
-with `FAR <= sv_target_far` (default 0.05), it minimizes FRR and then prefers the
-higher threshold. Future test FAR/FRR must use this persisted deployment threshold;
-test EER and its threshold remain descriptive only.
-
-Open-set SID is built independently inside each split. Seeded selection assigns 80%
-of speakers (round-half-up, with both sets kept non-empty) to known and the rest to
-unknown. Each known speaker contributes at most five deterministic enrollment
-utterances and retains at least one disjoint probe; unknown speakers contribute no
-enrollment and all their utterances are probes. Enrollment embeddings are averaged
-and L2-normalized into prototypes. Known top-1 identity accuracy remains a separate,
-threshold-independent intrinsic metric. SID deployment calibration first restricts
-empirical candidates to `unknown_false_accept_rate <= sid_target_unknown_far`
-(default 0.05), then maximizes `known_accepted_correct_rate`. Equal objectives prefer
-the higher threshold, and a reject-all sentinel guarantees a zero-unknown-FAR
-fallback. Balanced and raw overall open-set accuracy remain descriptive metrics and
-are not optimized.
-
-Validation and test speakers and paths are checked against each other and against the
-checkpoint's train-only `speaker_to_index`. Validation is the only phase that writes
-`calibration/sv_calibration.json` and `calibration/sid_calibration.json`. Test mode
-refuses to start without both persisted validation artifacts, reloads them before
-scoring, and never recalibrates or overwrites them. Calibration artifacts bind the
-policy/schema version, checkpoint SHA256, validation manifest fingerprint, seed,
-protocol settings, SV target FAR, and SID target unknown FAR. A1 validation/test remain the primary
-speaker-disjoint protocol; incomplete official Vietnam-Celeb E/H files are not used
-by this A4 implementation. Threshold-policy changes do not invalidate compatible
-embedding caches because cache identity is bound separately to the model, manifest,
-preprocessing, and embedding configuration.
-
-Validation-only Kaggle command:
-
-```bash
-python -m module_a.scripts.evaluate_model \
-  --phase validation \
-  --dataset-root /kaggle/input/datasets/davidthomastran/vietnam-celeb-dataset/full-dataset/data \
-  --val-manifest /kaggle/working/module_a_outputs/val_manifest.csv \
-  --checkpoint /kaggle/working/module_a-stage1-full-fixed/checkpoints/last.pt \
-  --output-dir /kaggle/working/module_a-a4-fixed \
-  --device cuda \
-  --seed 42 \
-  --max-sv-positive-per-speaker 20 \
-  --sid-known-ratio 0.8 \
-  --sid-max-enrollment 5 \
-  --sid-target-unknown-far 0.05 \
-  --sv-target-far 0.05
-```
-
-Only after reviewing/fixing the validation protocol and freezing its two calibration
-JSON files, run test-only evaluation against the same output directory:
-
-```bash
-python -m module_a.scripts.evaluate_model \
-  --phase test \
-  --dataset-root /kaggle/input/datasets/davidthomastran/vietnam-celeb-dataset/full-dataset/data \
-  --val-manifest /kaggle/working/module_a_outputs/val_manifest.csv \
-  --test-manifest /kaggle/working/module_a_outputs/test_manifest.csv \
-  --checkpoint /kaggle/working/module_a-stage1-full/checkpoints/last.pt \
-  --output-dir /kaggle/working/module_a_a4 \
-  --device cuda
-```
-
-The output tree contains `embeddings/`, `trials/`, `protocols/`, `scores/`,
-`calibration/`, `metrics/`, `run_config.json`, and `evaluation_summary.json`. Local
-offline verification never downloads WavLM:
-
-```bash
-python -m module_a.scripts.evaluate_model --help
-python -m module_a.scripts.sanity_evaluation
-```
-
-## Configuration
-
-`configs/dataset.yaml` is the A1 source of truth. The dataset root is intentionally
-`null` and should be supplied at runtime:
-
-```bash
-python -m module_a.scripts.inspect_dataset --dataset-root /kaggle/input/vietnam-celeb
-python -m module_a.scripts.prepare_manifests --dataset-root /kaggle/input/vietnam-celeb
-```
-
-Use `--output-dir /kaggle/working/module-a-outputs` to override the output directory.
-`inspection.max_files` can select a deterministic sorted subset for layout inspection.
-
-### Speaker ID strategies
-
-The default `speaker_id_source: parent_dir` is an explicit assumption that the
-immediate audio parent is the speaker ID. The CLI prints the selected strategy. Do
-not use it blindly before inspecting the real Vietnam-Celeb layout.
-
-- `parent_dir`: immediate parent directory.
-- `path_component`: component index relative to dataset root; configure
-  `speaker_id_path_component` (negative indices are allowed).
-- `metadata_csv`: configure `speaker_metadata_csv` and its path/ID column names.
-  A relative metadata CSV path is resolved from the dataset YAML file location;
-  audio paths inside the CSV are resolved relative to the dataset root.
-
-Audio directly under the dataset root, missing metadata rows, invalid components,
-or empty speaker IDs fail with a controlled error instead of receiving a guessed ID.
-
-## A1 output contracts
-
-Runtime files go to `module_a/outputs/` and are ignored by Git except `.gitkeep`:
-
-- `dataset_summary.json`
-- `train_manifest.csv`
-- `val_manifest.csv`
-- `test_manifest.csv`
-- `split_summary.json`
-
-Manifest columns are:
+Expected output:
 
 ```text
-path,speaker_id,split,duration_sec,sample_rate,channels
+outputs/
+├── manifests/train.csv
+├── manifests/validation.csv
+├── checkpoints/last.pt
+├── checkpoints/best.pt
+├── calibration/sv_calibration.json
+├── calibration/sid_calibration.json
+├── metrics/validation_metrics.json
+├── metrics/sv_test_metrics.json
+├── metrics/sid_test_metrics.json
+├── training_summary.json
+├── evaluation_summary.json
+└── module_a_export/
+    ├── model.pt
+    ├── config.json
+    ├── thresholds.json
+    └── metadata.json
 ```
 
-The first three columns are stable. `path` is POSIX-style and relative to the dataset
-root; consumers must resolve it against the same `--dataset-root`. This avoids baking
-Kaggle or local Windows absolute paths into reusable manifests.
+Stable runtime ABI:
 
-Unreadable/corrupt audio is counted in the dataset summary and never enters a manifest.
-Speakers with fewer than `min_utterances_per_speaker: 2` usable utterances are reported
-and excluded. The value 2 is an engineering eligibility default, not a calibrated
-quality threshold.
+```python
+from module_a.src.runtime import load_model, extract_embedding
 
-### Vietnam-Celeb protocol note
+model = load_model("outputs/module_a_export", device="auto")
+embedding = extract_embedding(model, "/path/to/audio.wav")
+```
 
-The Kaggle distribution contains the official Vietnam-Celeb `T`, `E`, and `H`
-protocol files, but the physically available audio in this Kaggle copy does not fully
-cover all referenced paths.
+The returned value is finite `numpy.float32`, shape `(192,)`, and L2-normalized.
 
-Therefore:
+## Kaggle Run All — five cells
 
-- the primary project protocol uses a reproducible speaker-disjoint 80/10/10 split
-  over the audio files physically available in the Kaggle distribution;
-- validation is used for checkpoint selection and threshold calibration;
-- the test split remains untouched until model and threshold decisions are frozen;
-- official `E` and `H` trials may be used later only as supplementary SV evaluation
-  after filtering to trials for which both referenced audio files exist;
-- any filtered `E`/`H` evaluation must report coverage and excluded-trial counts
-  explicitly;
-- `vietnam-celeb-t.txt` is not used as the primary training manifest because the
-  Kaggle audio copy does not fully cover its referenced utterances.
+### Cell 1 — clone/update and install
 
-## Split and reproducibility policy
+```python
+import os, pathlib, subprocess
 
-Speakers are sorted, shuffled with a local Python RNG using seed 42, and assigned by
-speaker—not by utterance—to train/validation/test at 80%/10%/10%. Allocation uses
-largest remainders, assigns every speaker exactly once, and deterministically moves a
-speaker from the largest split if rounding leaves a split empty. Fewer than three
-eligible speakers fail because a non-empty three-way speaker-disjoint split is
-impossible.
+REPO_URL = "https://github.com/hvpng/Secure-Virtual-Assistant-with-Speaker-Recognition.git"
+PROJECT_DIR = pathlib.Path("/kaggle/working/secure-voice-assistant")
+if PROJECT_DIR.exists():
+    subprocess.run(["git", "-C", str(PROJECT_DIR), "pull", "--ff-only"], check=True)
+else:
+    subprocess.run(["git", "clone", REPO_URL, str(PROJECT_DIR)], check=True)
+subprocess.run([
+    "python", "-m", "pip", "install", "-q", "-r",
+    str(PROJECT_DIR / "module_a" / "requirements.txt"),
+], check=True)
+os.chdir(PROJECT_DIR)
+```
 
-The validator rejects duplicate paths, speaker leakage, missing files, corrupt markers,
-invalid split names, empty fields, empty splits, and incomplete expected coverage.
-`seed_everything(42)` seeds Python and NumPy without requiring PyTorch or a GPU in A1.
+### Cell 2 — paths and dataset source
+
+```python
+import os, pathlib
+
+PROJECT_DIR = pathlib.Path("/kaggle/working/secure-voice-assistant")
+OUTPUT_DIR = pathlib.Path("/kaggle/working/voxvietnam_ecapa_outputs")
+
+# Local/Kaggle mount: set this to the parent containing VoxVietnam-T/O, or leave empty.
+DATASET_ROOT = os.environ.get("VOXVIETNAM_ROOT", "")
+
+# Hugging Face: add HF_TOKEN through Kaggle Secrets, never inline a real token here.
+HF_REPO_ID = "hustep-lab/VoxVietnam-Dataset"
+if not os.environ.get("HF_TOKEN"):
+    try:
+        from kaggle_secrets import UserSecretsClient
+        os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
+    except Exception:
+        os.environ["HF_TOKEN"] = ""  # Public/local sources may not require a token.
+print({"project": str(PROJECT_DIR), "output": str(OUTPUT_DIR), "local_dataset": DATASET_ROOT or None})
+```
+
+### Cell 3 — Phase 1 train + validation calibration
+
+```python
+import subprocess
+
+command = [
+    "python", "-m", "module_a.scripts.train_ecapa",
+    "--output-dir", str(OUTPUT_DIR),
+    "--device", "cuda",
+]
+command += ["--dataset-root", DATASET_ROOT] if DATASET_ROOT else ["--hf-repo-id", HF_REPO_ID]
+subprocess.run(command, cwd=PROJECT_DIR, check=True)
+```
+
+### Cell 4 — Phase 2 final evaluation + export
+
+```python
+import subprocess
+
+command = [
+    "python", "-m", "module_a.scripts.evaluate_export",
+    "--output-dir", str(OUTPUT_DIR),
+    "--device", "cuda",
+    "--sv-protocol", "auto",
+]
+command += ["--dataset-root", DATASET_ROOT] if DATASET_ROOT else ["--hf-repo-id", HF_REPO_ID]
+subprocess.run(command, cwd=PROJECT_DIR, check=True)
+```
+
+### Cell 5 — compact results and export listing
+
+```python
+import json
+
+for name in ("training_summary.json", "evaluation_summary.json"):
+    path = OUTPUT_DIR / name
+    print(f"\n{name}")
+    print(json.dumps(json.loads(path.read_text()), indent=2, ensure_ascii=False))
+print("\nExported files:")
+for path in sorted((OUTPUT_DIR / "module_a_export").iterdir()):
+    print(path.name, path.stat().st_size)
+```
 
 ## Local verification
 
 ```bash
 python -m compileall module_a
 pytest module_a/tests -q
-python -m module_a.scripts.inspect_dataset --help
-python -m module_a.scripts.prepare_manifests --help
-python -m module_a.scripts.sanity_check
+python -m module_a.scripts.train_ecapa --help
+python -m module_a.scripts.evaluate_export --help
 ```
 
-The sanity command creates temporary 16 kHz WAV fixtures, including one corrupt file,
-then proves discovery, metadata handling, 8/1/1 speaker allocation, manifest validation,
-and byte-identical repeated output. It deletes the temporary dataset afterward.
+Local tests use synthetic audio and small ECAPA channel counts. They do not access
+VoxVietnam, Hugging Face, or start a full training job.
 
-## Future Track B handoff
+## Dataset assumptions requiring Kaggle verification
 
-A5 must retain this application ABI:
-
-```python
-load_model(model_dir, device="auto")
-extract_embedding(model, audio_path)
-```
-
-The final embedding will be a finite, fixed-dimension, L2-normalized 1-D `np.float32`
-array. A0-A3 does not modify `backend/app/models/speaker_model.py`.
-
-Future exported fields remain `embedding_dimension`, `sv_threshold`, and
-`sid_threshold`. Enrollment-quality fields remain `min_duration`, `max_duration`,
-`min_speech_ratio`, `min_snr_db`, `max_clipping_ratio`, and `max_content_wer`.
-
-Quality calibration is not part of A1. Later Module A experiments must use the exact
-M1 definition: mono 16 kHz PCM16, WebRTC VAD mode 2, complete 30 ms frames, speech
-ratio from the same VAD classifications, and VAD-grouped SNR using the same power,
-edge-case, and clamping policy. Do not introduce a second SNR estimator.
+- Audio is expected below speaker directories; the default speaker ID is the second
+  path component from the end (`speaker/file.wav`). Change only the YAML component
+  depth if the official mounted layout includes an extra session directory.
+- Hugging Face snapshot paths are expected to contain directories named
+  `VoxVietnam-T` and `VoxVietnam-O`.
+- Official VoxVietnam-O trial-list filename, row schema, and path prefixes must be
+  checked against the actual gated distribution before claiming official metrics.

@@ -1,447 +1,504 @@
-"""A4 checkpoint inference, split isolation, and deterministic embedding caches."""
+"""Shared embedding extraction, SV metrics, and open-set SID evaluation."""
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
-import os
-import tempfile
-from dataclasses import dataclass, fields, replace
+import math
+import random
+from collections import defaultdict
+from dataclasses import asdict, dataclass
+from itertools import combinations
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
-from torch import Tensor, nn
+from torch.utils.data import DataLoader
 
-from module_a.src.audio_batch import (
-    DETERMINISTIC_SEGMENT_POLICY_VERSION,
-    load_waveform,
-    prepare_deterministic_segment,
-)
-from module_a.src.checkpoint import CHECKPOINT_FIELDS
-from module_a.src.config import ModuleAConfig, config_to_dict, load_config
-from module_a.src.device import autocast_context
-from module_a.src.model_factory import build_model
-from module_a.src.training_data import TrainingRecord, load_manifest
+from module_a.src.config import save_json
+from module_a.src.data import AudioRecord, VoxVietnamDataset, records_fingerprint
+from module_a.src.ecapa import SpeakerEmbeddingModel
 
 
 class EvaluationError(RuntimeError):
-    """Raised when A4 data, checkpoint, cache, or inference is unsafe."""
-
-
-EMBEDDING_PREPROCESSING_VERSION = DETERMINISTIC_SEGMENT_POLICY_VERSION
+    """Raised when an evaluation protocol or metric is invalid."""
 
 
 @dataclass(frozen=True)
-class EvaluationModelBundle:
-    model: nn.Module
-    config: ModuleAConfig
-    checkpoint_path: Path
-    checkpoint_sha256: str
-    num_classes: int
-    speaker_to_index: dict[str, int]
-    device: torch.device
+class SVTrial:
+    path_a: str
+    path_b: str
+    label: int
 
 
 @dataclass(frozen=True)
-class EmbeddingCache:
-    embeddings: dict[str, np.ndarray]
-    metadata: dict[str, Any]
+class SVScore:
+    path_a: str
+    path_b: str
+    label: int
+    score: float
 
 
-def write_json_atomic(path: str | Path, payload: Mapping[str, Any]) -> Path:
-    output = Path(path).expanduser().resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
-    )
-    os.close(descriptor)
-    temporary = Path(temporary_name)
-    try:
-        temporary.write_text(
-            json.dumps(dict(payload), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(temporary, output)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return output
-
-
-def read_json_object(path: str | Path) -> dict[str, Any]:
-    source = Path(path).expanduser().resolve()
-    if not source.is_file():
-        raise EvaluationError(f"Required JSON artifact does not exist: {source}")
-    try:
-        payload = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise EvaluationError(f"Cannot read JSON artifact: {source}") from exc
-    if not isinstance(payload, dict):
-        raise EvaluationError(f"JSON artifact must contain an object: {source}")
-    return payload
+@dataclass(frozen=True)
+class SIDProbeScore:
+    path: str
+    true_speaker: str
+    status: str
+    best_speaker: str
+    best_score: float
 
 
 def sha256_file(path: str | Path) -> str:
-    source = Path(path).expanduser().resolve()
-    if not source.is_file():
-        raise EvaluationError(f"File does not exist for fingerprinting: {source}")
     digest = hashlib.sha256()
-    try:
-        with source.open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                digest.update(chunk)
-    except OSError as exc:
-        raise EvaluationError(f"Cannot fingerprint file: {source}") from exc
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
     return digest.hexdigest()
 
 
-def fingerprint_records(records: Sequence[TrainingRecord]) -> str:
-    canonical = [
-        {"path": record.path, "speaker_id": record.speaker_id, "split": record.split}
-        for record in sorted(records, key=lambda item: (item.path, item.speaker_id))
-    ]
-    return hashlib.sha256(
-        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-
-def fingerprint_evaluation_config(config: ModuleAConfig) -> str:
-    serialized = config_to_dict(config)
-    relevant = {
-        "model": serialized["model"],
-        "audio": serialized["audio"],
-        "loss": serialized["loss"],
-        "evaluation_mixed_precision": serialized["evaluation"]["mixed_precision"],
-        "embedding_preprocessing": EMBEDDING_PREPROCESSING_VERSION,
-    }
-    return hashlib.sha256(
-        json.dumps(relevant, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-
-def load_split_manifest(path: str | Path, expected_split: str) -> list[TrainingRecord]:
-    if expected_split not in {"val", "test"}:
-        raise EvaluationError("A4 accepts only val or test manifests.")
-    try:
-        records = load_manifest(path)
-    except Exception as exc:
-        raise EvaluationError(f"Cannot load {expected_split} manifest: {path}") from exc
-    if any(record.split != expected_split for record in records):
-        raise EvaluationError(
-            f"{expected_split} manifest contains records from another split."
-        )
-    paths = [record.path for record in records]
-    if len(paths) != len(set(paths)):
-        raise EvaluationError(f"{expected_split} manifest contains duplicate paths.")
-    if len({record.speaker_id for record in records}) < 2:
-        raise EvaluationError(f"{expected_split} evaluation requires at least two speakers.")
-    return sorted(records, key=lambda item: (item.speaker_id, item.path))
-
-
-def validate_evaluation_isolation(
-    *,
-    train_speakers: Sequence[str],
-    validation_records: Sequence[TrainingRecord] | None = None,
-    test_records: Sequence[TrainingRecord] | None = None,
-) -> None:
-    train = set(train_speakers)
-    validation = {record.speaker_id for record in validation_records or ()}
-    test = {record.speaker_id for record in test_records or ()}
-    if train & validation:
-        raise EvaluationError("Train speaker leaked into A4 validation evaluation.")
-    if train & test:
-        raise EvaluationError("Train speaker leaked into A4 test evaluation.")
-    if validation & test:
-        raise EvaluationError("Validation/test speaker contamination detected.")
-    validation_paths = {record.path for record in validation_records or ()}
-    test_paths = {record.path for record in test_records or ()}
-    if validation_paths & test_paths:
-        raise EvaluationError("Validation/test path contamination detected.")
-
-
-def _replace_dataclass(instance: Any, values: Mapping[str, Any]) -> Any:
-    expected = {field.name for field in fields(instance)}
-    missing = expected - set(values)
-    if missing:
-        raise EvaluationError(f"Checkpoint config is missing fields: {sorted(missing)}")
-    replacements = {name: values[name] for name in expected}
-    if "campp_block_layers" in replacements:
-        replacements["campp_block_layers"] = tuple(replacements["campp_block_layers"])
-    return replace(instance, **replacements)
-
-
-def _config_from_checkpoint(payload: Mapping[str, Any]) -> ModuleAConfig:
-    saved = payload.get("config")
-    if not isinstance(saved, Mapping):
-        raise EvaluationError("Checkpoint config is missing or malformed.")
-    try:
-        base = load_config()
-        model = _replace_dataclass(base.model, saved["model"])
-        audio = _replace_dataclass(base.audio, saved["audio"])
-        loss = _replace_dataclass(base.loss, saved["loss"])
-        seed = int(saved["seed"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise EvaluationError("Checkpoint model/audio/loss config is malformed.") from exc
-    config = replace(base, seed=seed, model=model, audio=audio, loss=loss)
-    if not config.model.wavlm_frozen or config.model.stage2_enabled:
-        raise EvaluationError("A4 requires the frozen Stage-1 WavLM checkpoint.")
-    return config
-
-
-def load_evaluation_model(
-    checkpoint_path: str | Path,
+def extract_embeddings(
+    model: SpeakerEmbeddingModel,
+    records: Sequence[AudioRecord],
+    dataset_root: str | Path,
+    config: Mapping[str, Any],
     *,
     device: torch.device,
-    local_files_only: bool = False,
-    frontend: nn.Module | None = None,
-) -> EvaluationModelBundle:
-    """Reconstruct A3 exactly, load strictly, then expose eval-only embeddings."""
-
-    checkpoint = Path(checkpoint_path).expanduser().resolve()
-    if not checkpoint.is_file():
-        raise EvaluationError(f"Checkpoint does not exist: {checkpoint}")
-    try:
-        payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    except Exception as exc:
-        raise EvaluationError(f"Cannot load checkpoint: {checkpoint}") from exc
-    if not isinstance(payload, dict) or not CHECKPOINT_FIELDS.issubset(payload):
-        raise EvaluationError("Checkpoint is missing required A3 fields.")
-    config = _config_from_checkpoint(payload)
-    num_classes = payload.get("num_classes")
-    speaker_to_index = payload.get("speaker_to_index")
-    if (
-        isinstance(num_classes, bool)
-        or not isinstance(num_classes, int)
-        or num_classes <= 1
-        or not isinstance(speaker_to_index, dict)
-        or len(speaker_to_index) != num_classes
-        or set(speaker_to_index.values()) != set(range(num_classes))
-    ):
-        raise EvaluationError("Checkpoint classifier metadata is malformed.")
-    try:
-        model = build_model(
-            config,
-            num_classes=num_classes,
-            frontend=frontend,
-            local_files_only=local_files_only,
-        )
-        model.load_state_dict(payload["model_state_dict"], strict=True)
-        model.to(device)
-        model.eval()
-    except Exception as exc:
-        raise EvaluationError("Checkpoint state is incompatible with the A3 model.") from exc
-    if any(parameter.requires_grad for parameter in model.encoder.frontend.parameters()):
-        raise EvaluationError("A4 loaded a WavLM frontend that is not frozen.")
-    return EvaluationModelBundle(
-        model=model,
-        config=config,
-        checkpoint_path=checkpoint,
-        checkpoint_sha256=sha256_file(checkpoint),
-        num_classes=num_classes,
-        speaker_to_index=dict(speaker_to_index),
-        device=device,
-    )
-
-
-def validate_embedding_vector(vector: np.ndarray, embedding_dimension: int) -> np.ndarray:
-    embedding = np.asarray(vector, dtype=np.float32)
-    if embedding.shape != (embedding_dimension,) or not np.isfinite(embedding).all():
-        raise EvaluationError("Embedding must be finite, 1-D, and fixed-dimensional.")
-    norm = float(np.linalg.norm(embedding))
-    if not np.isfinite(norm) or not np.isclose(norm, 1.0, atol=1e-4):
-        raise EvaluationError("Evaluation embedding must already be L2-normalized.")
-    return embedding
-
-
-def extract_embeddings(
-    bundle: EvaluationModelBundle,
-    records: Sequence[TrainingRecord],
-    *,
-    dataset_root: str | Path,
-    batch_size: int | None = None,
 ) -> dict[str, np.ndarray]:
-    """Extract deterministic center-cropped embeddings; FP32 is the A4 default."""
-
-    if not records:
-        raise EvaluationError("Cannot extract embeddings for an empty manifest.")
-    root = Path(dataset_root).expanduser().resolve()
-    if not root.is_dir():
-        raise EvaluationError(f"Dataset root does not exist: {root}")
-    effective_batch_size = batch_size or bundle.config.evaluation.embedding_batch_size
-    if effective_batch_size <= 0:
-        raise EvaluationError("Embedding batch size must be positive.")
-    ordered = sorted(records, key=lambda item: item.path)
-    output: dict[str, np.ndarray] = {}
-    bundle.model.eval()
+    dataset = VoxVietnamDataset(
+        records,
+        dataset_root,
+        sample_rate=int(config["audio"]["sample_rate"]),
+        segment_seconds=float(config["audio"]["segment_seconds"]),
+        training=False,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=int(config["evaluation"]["batch_size"]),
+        shuffle=False,
+        num_workers=int(config["training"]["num_workers"]),
+    )
+    model.eval()
+    embeddings: dict[str, np.ndarray] = {}
     with torch.no_grad():
-        for offset in range(0, len(ordered), effective_batch_size):
-            batch_records = ordered[offset : offset + effective_batch_size]
-            waveforms: list[Tensor] = []
-            for record in batch_records:
-                resolved = (root / Path(record.path)).resolve()
-                try:
-                    resolved.relative_to(root)
-                except ValueError as exc:
-                    raise EvaluationError("Manifest audio path escapes dataset root.") from exc
-                try:
-                    waveforms.append(
-                        load_waveform(
-                            resolved,
-                            target_sample_rate=bundle.config.audio.target_sample_rate,
-                        )
-                    )
-                except Exception as exc:
-                    raise EvaluationError(f"Cannot load evaluation audio: {record.path}") from exc
-            segments = [
-                prepare_deterministic_segment(
-                    waveform,
-                    sample_rate=bundle.config.audio.target_sample_rate,
-                    segment_seconds=bundle.config.audio.segment_seconds,
-                )
-                for waveform in waveforms
-            ]
-            waveform_batch = torch.stack(segments)
-            attention_mask = torch.ones(
-                waveform_batch.shape,
-                dtype=torch.long,
+        for batch in loader:
+            vectors = model.extract_embedding(batch["waveform"].to(device)).float().cpu().numpy()
+            for path, vector in zip(batch["path"], vectors, strict=True):
+                array = np.asarray(vector, dtype=np.float32)
+                if (
+                    array.shape != (int(config["model"]["embedding_dim"]),)
+                    or not np.isfinite(array).all()
+                    or not np.isclose(np.linalg.norm(array), 1.0, atol=1e-4)
+                ):
+                    raise EvaluationError(f"Invalid embedding extracted for: {path}")
+                embeddings[str(path)] = array
+    if len(embeddings) != len(records):
+        raise EvaluationError("Embedding extraction did not cover every manifest record.")
+    return embeddings
+
+
+def build_sv_trials(
+    records: Sequence[AudioRecord], *, seed: int, max_positive_per_speaker: int
+) -> list[SVTrial]:
+    grouped: dict[str, list[str]] = defaultdict(list)
+    for record in records:
+        grouped[record.speaker_id].append(record.path)
+    if len(grouped) < 2 or max_positive_per_speaker <= 0:
+        raise EvaluationError("SV trials require at least two speakers and a positive cap.")
+    positives: list[SVTrial] = []
+    for paths in grouped.values():
+        paths.sort()
+    for speaker in sorted(grouped):
+        pairs = list(combinations(grouped[speaker], 2))
+        if len(pairs) > max_positive_per_speaker:
+            speaker_seed = int.from_bytes(
+                hashlib.sha256(f"{seed}:{speaker}".encode()).digest()[:8], "big"
             )
-            waveform_batch = waveform_batch.to(bundle.device)
-            attention_mask = attention_mask.to(bundle.device)
-            with autocast_context(
-                bundle.device, bundle.config.evaluation.mixed_precision
-            ):
-                embeddings = bundle.model.extract_embedding(
-                    waveform_batch, attention_mask=attention_mask
-                )
-            embeddings = embeddings.detach().to(device="cpu", dtype=torch.float32).numpy()
-            if embeddings.shape != (
-                len(batch_records),
-                bundle.config.model.embedding_dimension,
-            ):
-                raise EvaluationError("Model returned an invalid embedding batch shape.")
-            for record, vector in zip(batch_records, embeddings, strict=True):
-                output[record.path] = validate_embedding_vector(
-                    vector, bundle.config.model.embedding_dimension
-                ).copy()
-    if len(output) != len(records):
-        raise EvaluationError("Embedding extraction lost or duplicated manifest paths.")
-    return output
+            pairs = random.Random(speaker_seed).sample(pairs, max_positive_per_speaker)
+        positives.extend(SVTrial(min(a, b), max(a, b), 1) for a, b in pairs)
+    positives.sort(key=lambda trial: (trial.path_a, trial.path_b))
+    if not positives:
+        raise EvaluationError("SV protocol contains no positive trials.")
+
+    speakers = sorted(grouped)
+    rng = random.Random(seed)
+    negatives: dict[tuple[str, str], SVTrial] = {}
+    maximum_attempts = len(positives) * 100 + 1000
+    for _ in range(maximum_attempts):
+        if len(negatives) == len(positives):
+            break
+        left_speaker, right_speaker = rng.sample(speakers, 2)
+        a = rng.choice(grouped[left_speaker])
+        b = rng.choice(grouped[right_speaker])
+        key = tuple(sorted((a, b)))
+        negatives[key] = SVTrial(key[0], key[1], 0)
+    if len(negatives) != len(positives):
+        raise EvaluationError("Cannot create enough unique negative SV trials.")
+    trials = positives + sorted(negatives.values(), key=lambda item: (item.path_a, item.path_b))
+    validate_sv_trials(trials)
+    return trials
 
 
-def _cache_metadata(
-    *,
-    bundle: EvaluationModelBundle,
-    records: Sequence[TrainingRecord],
-    split: str,
-    dataset_root: str | Path,
-) -> dict[str, Any]:
+def validate_sv_trials(trials: Sequence[SVTrial]) -> None:
+    if not trials or {trial.label for trial in trials} != {0, 1}:
+        raise EvaluationError("SV trials require both positive and negative labels.")
+    seen: set[tuple[str, str]] = set()
+    for trial in trials:
+        if trial.path_a == trial.path_b or trial.label not in {0, 1}:
+            raise EvaluationError("SV trial contains a self-pair or invalid label.")
+        key = tuple(sorted((trial.path_a, trial.path_b)))
+        if key in seen:
+            raise EvaluationError("Duplicate unordered SV trial pair detected.")
+        seen.add(key)
+
+
+def load_official_sv_trials(
+    path: str | Path, available_paths: set[str]
+) -> list[SVTrial]:
+    trial_path = Path(path).expanduser().resolve()
+    if not trial_path.is_file():
+        raise EvaluationError(f"Official trial file does not exist: {trial_path}")
+    trials: list[SVTrial] = []
+    lines = trial_path.read_text(encoding="utf-8").splitlines()
+    for line_number, raw in enumerate(lines, start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        values = [part.strip() for part in (line.split(",") if "," in line else line.split())]
+        if line_number == 1 and {value.lower() for value in values} >= {"label"}:
+            continue
+        if len(values) != 3:
+            raise EvaluationError(f"Unsupported official trial row at line {line_number}.")
+        if values[0].lower() in {"0", "1", "target", "nontarget", "same", "different"}:
+            raw_label, first, second = values
+        else:
+            first, second, raw_label = values
+        normalized_label = raw_label.lower()
+        if normalized_label in {"1", "target", "same"}:
+            label = 1
+        elif normalized_label in {"0", "nontarget", "different"}:
+            label = 0
+        else:
+            raise EvaluationError(f"Unknown official trial label: {raw_label}")
+        first = first.replace("\\", "/").lstrip("./")
+        second = second.replace("\\", "/").lstrip("./")
+        if first not in available_paths or second not in available_paths:
+            raise EvaluationError(
+                "Official VoxVietnam-O trial references audio absent from the mounted dataset."
+            )
+        trials.append(SVTrial(first, second, label))
+    validate_sv_trials(trials)
+    return trials
+
+
+def score_sv_trials(
+    trials: Sequence[SVTrial], embeddings: Mapping[str, np.ndarray]
+) -> list[SVScore]:
+    scores: list[SVScore] = []
+    for trial in trials:
+        try:
+            score = float(np.dot(embeddings[trial.path_a], embeddings[trial.path_b]))
+        except KeyError as exc:
+            raise EvaluationError("SV trial references a missing embedding.") from exc
+        if not math.isfinite(score) or not -1.0001 <= score <= 1.0001:
+            raise EvaluationError("SV cosine score is invalid.")
+        scores.append(SVScore(trial.path_a, trial.path_b, trial.label, score))
+    return scores
+
+
+def _thresholds(values: Sequence[float]) -> list[float]:
+    unique = sorted(set(float(value) for value in values), reverse=True)
+    if not unique or not all(math.isfinite(value) for value in unique):
+        raise EvaluationError("Threshold candidates require finite scores.")
+    return [math.nextafter(unique[0], math.inf), *unique]
+
+
+def sv_rates(scores: Sequence[SVScore], threshold: float) -> dict[str, float]:
+    positives = [score.score for score in scores if score.label == 1]
+    negatives = [score.score for score in scores if score.label == 0]
+    if not positives or not negatives:
+        raise EvaluationError("SV rates require both trial classes.")
+    far = sum(value >= threshold for value in negatives) / len(negatives)
+    frr = sum(value < threshold for value in positives) / len(positives)
+    return {"far": float(far), "frr": float(frr), "tpr": float(1.0 - frr)}
+
+
+def compute_sv_metrics(scores: Sequence[SVScore]) -> dict[str, Any]:
+    roc = [
+        {"threshold": threshold, **sv_rates(scores, threshold)}
+        for threshold in _thresholds([score.score for score in scores])
+    ]
+    eer_point = min(
+        roc, key=lambda item: (abs(item["far"] - item["frr"]), -item["threshold"])
+    )
+    points = sorted((item["far"], item["tpr"]) for item in roc)
+    auc = sum(
+        (x1 - x0) * (y0 + y1) / 2
+        for (x0, y0), (x1, y1) in zip(points, points[1:])
+    )
     return {
-        "schema_version": 2,
-        "embedding_preprocessing": EMBEDDING_PREPROCESSING_VERSION,
-        "split": split,
-        "embedding_dimension": bundle.config.model.embedding_dimension,
-        "checkpoint_sha256": bundle.checkpoint_sha256,
-        "manifest_sha256": fingerprint_records(records),
-        "config_sha256": fingerprint_evaluation_config(bundle.config),
-        "dataset_root": str(Path(dataset_root).expanduser().resolve()),
-        "record_count": len(records),
+        "eer": float((eer_point["far"] + eer_point["frr"]) / 2),
+        "eer_threshold": float(eer_point["threshold"]),
+        "auc": float(auc),
+        "far_at_eer": float(eer_point["far"]),
+        "frr_at_eer": float(eer_point["frr"]),
+        "positive_trials": sum(score.label == 1 for score in scores),
+        "negative_trials": sum(score.label == 0 for score in scores),
+        "eer_method": "closest empirical FAR/FRR; no interpolation; higher-threshold tie-break",
     }
 
 
-def write_embedding_cache(
-    path: str | Path,
+def calibrate_sv(scores: Sequence[SVScore], target_far: float) -> dict[str, Any]:
+    if not 0 <= target_far <= 1:
+        raise EvaluationError("SV target FAR must be between 0 and 1.")
+    candidates = [
+        {"threshold": threshold, **sv_rates(scores, threshold)}
+        for threshold in _thresholds([score.score for score in scores])
+    ]
+    feasible = [candidate for candidate in candidates if candidate["far"] <= target_far]
+    selected = min(feasible, key=lambda item: (item["frr"], -item["threshold"]))
+    intrinsic = compute_sv_metrics(scores)
+    return {
+        "schema_version": 1,
+        "source": "validation",
+        "policy": "target_far_empirical_v1",
+        "target_far": float(target_far),
+        "threshold": float(selected["threshold"]),
+        "far": float(selected["far"]),
+        "frr": float(selected["frr"]),
+        "tar": float(selected["tpr"]),
+        "validation_eer": intrinsic["eer"],
+        "validation_eer_threshold": intrinsic["eer_threshold"],
+    }
+
+
+def build_sid_protocol(
+    records: Sequence[AudioRecord],
+    *,
+    seed: int,
+    known_ratio: float,
+    max_enrollment: int,
+) -> dict[str, Any]:
+    grouped: dict[str, list[str]] = defaultdict(list)
+    for record in records:
+        grouped[record.speaker_id].append(record.path)
+    speakers = sorted(grouped)
+    if len(speakers) < 2 or not 0 < known_ratio < 1 or max_enrollment <= 0:
+        raise EvaluationError("Invalid open-set SID protocol configuration.")
+    shuffled = speakers.copy()
+    random.Random(seed).shuffle(shuffled)
+    known_count = max(1, min(len(speakers) - 1, round(len(speakers) * known_ratio)))
+    known = sorted(shuffled[:known_count])
+    unknown = sorted(shuffled[known_count:])
+    enrollment: dict[str, list[str]] = {}
+    probes: list[dict[str, str]] = []
+    for speaker in known:
+        paths = sorted(grouped[speaker])
+        if len(paths) < 2:
+            raise EvaluationError(f"Known SID speaker needs enrollment and probe: {speaker}")
+        local = paths.copy()
+        speaker_seed = int.from_bytes(
+            hashlib.sha256(f"{seed}:{speaker}".encode()).digest()[:8], "big"
+        )
+        random.Random(speaker_seed).shuffle(local)
+        count = min(max_enrollment, len(local) - 1)
+        selected = sorted(local[:count])
+        enrollment[speaker] = selected
+        selected_set = set(selected)
+        probes.extend(
+            {"path": path, "speaker_id": speaker, "status": "known"}
+            for path in paths
+            if path not in selected_set
+        )
+    for speaker in unknown:
+        probes.extend(
+            {"path": path, "speaker_id": speaker, "status": "unknown"}
+            for path in sorted(grouped[speaker])
+        )
+    return {
+        "protocol": "custom_open_set_sid_v1",
+        "seed": seed,
+        "known_ratio": known_ratio,
+        "max_enrollment": max_enrollment,
+        "known_speakers": known,
+        "unknown_speakers": unknown,
+        "enrollment": enrollment,
+        "probes": sorted(probes, key=lambda item: (item["status"], item["speaker_id"], item["path"])),
+    }
+
+
+def build_sid_prototypes(
+    protocol: Mapping[str, Any], embeddings: Mapping[str, np.ndarray]
+) -> dict[str, np.ndarray]:
+    prototypes: dict[str, np.ndarray] = {}
+    for speaker, paths in protocol["enrollment"].items():
+        try:
+            prototype = np.stack([embeddings[path] for path in paths]).mean(axis=0)
+        except KeyError as exc:
+            raise EvaluationError("SID enrollment references a missing embedding.") from exc
+        norm = float(np.linalg.norm(prototype))
+        if not math.isfinite(norm) or norm <= 1e-12:
+            raise EvaluationError("SID prototype has zero or invalid norm.")
+        prototypes[speaker] = np.asarray(prototype / norm, dtype=np.float32)
+    return prototypes
+
+
+def score_sid(
+    protocol: Mapping[str, Any],
     embeddings: Mapping[str, np.ndarray],
-    metadata: Mapping[str, Any],
-) -> Path:
+    prototypes: Mapping[str, np.ndarray],
+) -> list[SIDProbeScore]:
+    speakers = sorted(prototypes)
+    matrix = np.stack([prototypes[speaker] for speaker in speakers])
+    scores: list[SIDProbeScore] = []
+    for probe in protocol["probes"]:
+        if probe["path"] not in embeddings:
+            raise EvaluationError("SID probe references a missing embedding.")
+        similarities = matrix @ embeddings[probe["path"]]
+        best = int(np.argmax(similarities))
+        score = float(similarities[best])
+        if not math.isfinite(score):
+            raise EvaluationError("SID produced a non-finite score.")
+        scores.append(
+            SIDProbeScore(
+                probe["path"], probe["speaker_id"], probe["status"], speakers[best], score
+            )
+        )
+    return scores
+
+
+def sid_metrics(scores: Sequence[SIDProbeScore], threshold: float) -> dict[str, Any]:
+    known = [score for score in scores if score.status == "known"]
+    unknown = [score for score in scores if score.status == "unknown"]
+    if not known or not unknown:
+        raise EvaluationError("SID metrics require known and unknown probes.")
+    top1 = sum(score.best_speaker == score.true_speaker for score in known)
+    accepted_correct = sum(
+        score.best_score >= threshold and score.best_speaker == score.true_speaker
+        for score in known
+    )
+    wrong_accept = sum(
+        score.best_score >= threshold and score.best_speaker != score.true_speaker
+        for score in known
+    )
+    known_reject = sum(score.best_score < threshold for score in known)
+    unknown_reject = sum(score.best_score < threshold for score in unknown)
+    return {
+        "threshold": float(threshold),
+        "known_probe_count": len(known),
+        "unknown_probe_count": len(unknown),
+        "known_top1_identity_accuracy": float(top1 / len(known)),
+        "known_accepted_correct_rate": float(accepted_correct / len(known)),
+        "known_wrong_accept_rate": float(wrong_accept / len(known)),
+        "known_rejection_rate": float(known_reject / len(known)),
+        "unknown_false_accept_rate": float((len(unknown) - unknown_reject) / len(unknown)),
+        "unknown_rejection_rate": float(unknown_reject / len(unknown)),
+    }
+
+
+def calibrate_sid(scores: Sequence[SIDProbeScore], target_unknown_far: float) -> dict[str, Any]:
+    if not 0 <= target_unknown_far <= 1:
+        raise EvaluationError("SID target unknown FAR must be between 0 and 1.")
+    candidates = [
+        sid_metrics(scores, threshold)
+        for threshold in _thresholds([score.best_score for score in scores])
+    ]
+    feasible = [
+        candidate
+        for candidate in candidates
+        if candidate["unknown_false_accept_rate"] <= target_unknown_far
+    ]
+    selected = max(
+        feasible,
+        key=lambda item: (item["known_accepted_correct_rate"], item["threshold"]),
+    )
+    return {
+        "schema_version": 1,
+        "source": "validation",
+        "policy": "target_unknown_far_empirical_v1",
+        "target_unknown_far": float(target_unknown_far),
+        **selected,
+    }
+
+
+def evaluate_validation(
+    records: Sequence[AudioRecord],
+    embeddings: Mapping[str, np.ndarray],
+    config: Mapping[str, Any],
+    *,
+    checkpoint_sha256: str,
+    output_dir: str | Path,
+) -> dict[str, Any]:
+    seed = int(config["seed"])
+    training = config["training"]
+    calibration_config = config["calibration"]
+    sv_trials = build_sv_trials(
+        records,
+        seed=seed,
+        max_positive_per_speaker=int(training["max_positive_trials_per_speaker"]),
+    )
+    sv_scores = score_sv_trials(sv_trials, embeddings)
+    sv_metric = compute_sv_metrics(sv_scores)
+    sv_calibration = calibrate_sv(sv_scores, float(calibration_config["sv_target_far"]))
+    sid_protocol = build_sid_protocol(
+        records,
+        seed=seed,
+        known_ratio=float(calibration_config["sid_known_ratio"]),
+        max_enrollment=int(calibration_config["sid_max_enrollment"]),
+    )
+    sid_scores = score_sid(
+        sid_protocol, embeddings, build_sid_prototypes(sid_protocol, embeddings)
+    )
+    sid_calibration = calibrate_sid(
+        sid_scores, float(calibration_config["sid_target_unknown_far"])
+    )
+    sid_metric = sid_metrics(sid_scores, float(sid_calibration["threshold"]))
+    provenance = {
+        "checkpoint_sha256": checkpoint_sha256,
+        "validation_manifest_fingerprint": records_fingerprint(records),
+        "seed": seed,
+    }
+    sv_calibration.update(provenance)
+    sid_calibration.update(provenance)
+    output = Path(output_dir).expanduser().resolve()
+    save_json(output / "calibration" / "sv_calibration.json", sv_calibration)
+    save_json(output / "calibration" / "sid_calibration.json", sid_calibration)
+    metrics = {
+        "source": "speaker_disjoint_validation_from_voxvietnam_t",
+        "sv": {**sv_metric, "deployment": sv_calibration},
+        "sid": {**sid_metric, "protocol": "custom_open_set_sid_v1"},
+    }
+    save_json(output / "metrics" / "validation_metrics.json", metrics)
+    return metrics
+
+
+def load_frozen_calibrations(
+    output_dir: str | Path, *, checkpoint_sha256: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    root = Path(output_dir).expanduser().resolve() / "calibration"
+    try:
+        sv = json.loads((root / "sv_calibration.json").read_text(encoding="utf-8"))
+        sid = json.loads((root / "sid_calibration.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise EvaluationError("Frozen validation calibration artifacts are missing or invalid.") from exc
+    if (
+        sv.get("source") != "validation"
+        or sv.get("policy") != "target_far_empirical_v1"
+        or sid.get("source") != "validation"
+        or sid.get("policy") != "target_unknown_far_empirical_v1"
+        or sv.get("checkpoint_sha256") != checkpoint_sha256
+        or sid.get("checkpoint_sha256") != checkpoint_sha256
+    ):
+        raise EvaluationError("Frozen calibration is incompatible with best.pt.")
+    return sv, sid
+
+
+def write_sv_scores(path: str | Path, scores: Sequence[SVScore]) -> Path:
     output = Path(path).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    ordered_paths = sorted(embeddings)
-    dimension = int(metadata.get("embedding_dimension", 0))
-    if not ordered_paths or dimension <= 0:
-        raise EvaluationError("Embedding cache cannot be empty.")
-    matrix = np.stack(
-        [validate_embedding_vector(embeddings[path], dimension) for path in ordered_paths]
-    ).astype(np.float32, copy=False)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
-    )
-    os.close(descriptor)
-    temporary = Path(temporary_name)
-    try:
-        with temporary.open("wb") as stream:
-            np.savez_compressed(
-                stream,
-                paths=np.asarray(ordered_paths, dtype=np.str_),
-                embeddings=matrix,
-                metadata_json=np.asarray(
-                    json.dumps(dict(metadata), sort_keys=True, separators=(",", ":")),
-                    dtype=np.str_,
-                ),
-            )
-        os.replace(temporary, output)
-    finally:
-        temporary.unlink(missing_ok=True)
+    with output.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=("path_a", "path_b", "label", "score"))
+        writer.writeheader()
+        writer.writerows(asdict(score) for score in scores)
     return output
-
-
-def load_embedding_cache(
-    path: str | Path, expected_metadata: Mapping[str, Any]
-) -> EmbeddingCache:
-    source = Path(path).expanduser().resolve()
-    if not source.is_file():
-        raise EvaluationError(f"Embedding cache does not exist: {source}")
-    try:
-        with np.load(source, allow_pickle=False) as payload:
-            paths = payload["paths"]
-            matrix = payload["embeddings"]
-            metadata = json.loads(str(payload["metadata_json"].item()))
-    except Exception as exc:
-        raise EvaluationError(f"Cannot read embedding cache: {source}") from exc
-    if metadata != dict(expected_metadata):
-        raise EvaluationError(
-            "Embedding cache metadata is incompatible; use --recompute-embeddings."
-        )
-    if paths.ndim != 1 or matrix.ndim != 2 or len(paths) != len(matrix):
-        raise EvaluationError("Embedding cache arrays are malformed.")
-    dimension = int(metadata["embedding_dimension"])
-    embeddings: dict[str, np.ndarray] = {}
-    for raw_path, vector in zip(paths.tolist(), matrix, strict=True):
-        normalized_path = str(raw_path)
-        if normalized_path in embeddings:
-            raise EvaluationError("Embedding cache contains duplicate paths.")
-        embeddings[normalized_path] = validate_embedding_vector(vector, dimension).copy()
-    if len(embeddings) != int(metadata["record_count"]):
-        raise EvaluationError("Embedding cache record count is inconsistent.")
-    return EmbeddingCache(embeddings=embeddings, metadata=dict(metadata))
-
-
-def get_or_create_embedding_cache(
-    path: str | Path,
-    *,
-    bundle: EvaluationModelBundle,
-    records: Sequence[TrainingRecord],
-    split: str,
-    dataset_root: str | Path,
-    recompute: bool = False,
-    extractor: Callable[[], Mapping[str, np.ndarray]] | None = None,
-) -> EmbeddingCache:
-    metadata = _cache_metadata(
-        bundle=bundle,
-        records=records,
-        split=split,
-        dataset_root=dataset_root,
-    )
-    cache_path = Path(path).expanduser().resolve()
-    if cache_path.exists() and not recompute:
-        return load_embedding_cache(cache_path, metadata)
-    produced = (
-        extractor()
-        if extractor is not None
-        else extract_embeddings(bundle, records, dataset_root=dataset_root)
-    )
-    expected_paths = {record.path for record in records}
-    if set(produced) != expected_paths:
-        raise EvaluationError("Embedding extractor output does not match the manifest paths.")
-    write_embedding_cache(cache_path, produced, metadata)
-    return load_embedding_cache(cache_path, metadata)

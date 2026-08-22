@@ -1,7 +1,7 @@
 numpy
 PyYAML
-pytest
 soundfile
 torch
 torchaudio
-transformers
+huggingface-hub
+pytest

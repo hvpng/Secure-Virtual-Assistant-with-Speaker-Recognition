@@ -1,77 +1,51 @@
 from __future__ import annotations
 
-import math
-import wave
-from array import array
+import copy
 from pathlib import Path
 
+import numpy as np
 import pytest
-import torch
-
-from dataclasses import replace
+import soundfile as sf
 
 from module_a.src.config import load_config
-from module_a.src.model_factory import build_model
-from module_a.src.models.wavlm_frontend import DeterministicFakeWavLM
+
+
+@pytest.fixture
+def tiny_config():
+    config = copy.deepcopy(load_config())
+    config["audio"]["segment_seconds"] = 0.2
+    config["model"].update({"channels": 16, "scale": 4, "se_channels": 4})
+    config["training"].update(
+        {
+            "epochs": 1,
+            "batch_size": 4,
+            "speakers_per_batch": 2,
+            "utterances_per_speaker": 2,
+            "gradient_accumulation": 1,
+            "amp": False,
+            "num_workers": 0,
+            "validate_every_epochs": 1,
+            "max_positive_trials_per_speaker": 1,
+        }
+    )
+    config["augmentation"].update(
+        {"speed_perturb": False, "additive_noise": False, "reverb": False}
+    )
+    config["evaluation"]["batch_size"] = 4
+    config["calibration"].update(
+        {"sid_known_ratio": 0.5, "sid_max_enrollment": 1}
+    )
+    return config
 
 
 @pytest.fixture
 def write_wav():
-    def _write(
-        path: Path,
-        *,
-        sample_rate: int = 16_000,
-        duration_sec: float = 0.1,
-        channels: int = 1,
-    ) -> Path:
+    def _write(path: Path, *, seconds: float = 0.25, sample_rate: int = 16_000) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
-        frame_count = round(sample_rate * duration_sec)
-        mono = [
-            int(2_000 * math.sin(2 * math.pi * 220 * index / sample_rate))
-            for index in range(frame_count)
-        ]
-        samples = array("h", (value for value in mono for _ in range(channels)))
-        with wave.open(str(path), "wb") as audio:
-            audio.setnchannels(channels)
-            audio.setsampwidth(2)
-            audio.setframerate(sample_rate)
-            audio.writeframes(samples.tobytes())
+        count = round(seconds * sample_rate)
+        time = np.arange(count, dtype=np.float32) / sample_rate
+        waveform = 0.1 * np.sin(2 * np.pi * 220 * time)
+        sf.write(path, waveform, sample_rate, subtype="PCM_16")
         return path
 
     return _write
-
-
-@pytest.fixture
-def small_model_config():
-    config = load_config()
-    return replace(
-        config,
-        model=replace(
-            config.model,
-            campp_growth_rate=4,
-            campp_block_layers=(1, 1, 1),
-            campp_init_channels=8,
-            campp_bottleneck_channels=8,
-            campp_fcm_channels=4,
-            campp_segment_frames=4,
-        ),
-    )
-
-
-@pytest.fixture
-def training_model(small_model_config):
-    torch.manual_seed(42)
-    return build_model(
-        small_model_config,
-        num_classes=3,
-        frontend=DeterministicFakeWavLM(
-            small_model_config.model.wavlm_hidden_dimension,
-            frame_count=12,
-        ),
-    )
-
-
-@pytest.fixture
-def waveform_batch():
-    first = torch.linspace(-0.5, 0.5, steps=1_600)
-    return torch.stack((first, first.flip(0)))
