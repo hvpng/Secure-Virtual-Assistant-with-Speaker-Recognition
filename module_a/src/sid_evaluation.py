@@ -24,6 +24,8 @@ from module_a.src.training_data import TrainingRecord
 
 
 UNKNOWN_IDENTITY = "UNKNOWN"
+SID_CALIBRATION_SCHEMA_VERSION = 2
+SID_CALIBRATION_POLICY_VERSION = "sid_balanced_open_set_accuracy_v1"
 
 
 @dataclass(frozen=True)
@@ -263,16 +265,21 @@ def sid_metrics_at_threshold(
     unknown_rejected = sum(score.best_score < threshold for score in unknown)
     unknown_false_accept = len(unknown) - unknown_rejected
     correct = known_accepted_correct + unknown_rejected
+    known_accepted_correct_rate = known_accepted_correct / len(known)
+    unknown_rejection_rate = unknown_rejected / len(unknown)
     return {
         "threshold": float(threshold),
         "known_probe_count": len(known),
         "unknown_probe_count": len(unknown),
         "known_top1_identity_accuracy": float(known_top1),
-        "known_accepted_correct_rate": float(known_accepted_correct / len(known)),
+        "known_accepted_correct_rate": float(known_accepted_correct_rate),
         "known_wrong_accept_rate": float(known_wrong_accept / len(known)),
         "known_rejection_rate": float(known_rejected / len(known)),
-        "unknown_rejection_rate": float(unknown_rejected / len(unknown)),
+        "unknown_rejection_rate": float(unknown_rejection_rate),
         "unknown_false_accept_rate": float(unknown_false_accept / len(unknown)),
+        "balanced_open_set_accuracy": float(
+            0.5 * known_accepted_correct_rate + 0.5 * unknown_rejection_rate
+        ),
         "overall_open_set_accuracy": float(correct / len(scores)),
     }
 
@@ -310,13 +317,19 @@ def calibrate_sid_threshold(scores: Sequence[SIDProbeScore]) -> dict[str, Any]:
     selected = max(
         candidates,
         key=lambda metrics: (
-            metrics["overall_open_set_accuracy"],
+            metrics["balanced_open_set_accuracy"],
             metrics["threshold"],
         ),
     )
     return {
+        "calibration_schema_version": SID_CALIBRATION_SCHEMA_VERSION,
+        "calibration_policy_version": SID_CALIBRATION_POLICY_VERSION,
         "source_split": "validation",
-        "objective": "maximize validation overall open-set accuracy",
+        "objective": "maximize validation balanced open-set accuracy",
+        "objective_formula": (
+            "0.5 * known_accepted_correct_rate + "
+            "0.5 * unknown_rejection_rate"
+        ),
         "tie_breaker": "higher threshold",
         "selected_threshold": selected["threshold"],
         **{key: value for key, value in selected.items() if key != "threshold"},
@@ -331,9 +344,17 @@ def load_frozen_sid_calibration(
 ) -> dict[str, Any]:
     calibration = read_json_object(path)
     threshold = calibration.get("selected_threshold")
-    if calibration.get("source_split") != "validation" or not isinstance(
-        threshold, (int, float)
-    ) or not math.isfinite(float(threshold)):
+    if (
+        calibration.get("calibration_schema_version")
+        != SID_CALIBRATION_SCHEMA_VERSION
+        or calibration.get("calibration_policy_version")
+        != SID_CALIBRATION_POLICY_VERSION
+        or calibration.get("source_split") != "validation"
+        or calibration.get("objective")
+        != "maximize validation balanced open-set accuracy"
+        or not isinstance(threshold, (int, float))
+        or not math.isfinite(float(threshold))
+    ):
         raise EvaluationError("SID calibration is not a frozen validation artifact.")
     for key, expected in (expected_provenance or {}).items():
         if calibration.get(key) != expected:
@@ -347,8 +368,8 @@ def write_sid_calibration(
     *,
     provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    calibration = calibrate_sid_threshold(scores)
-    calibration.update(dict(provenance or {}))
+    calibration = dict(provenance or {})
+    calibration.update(calibrate_sid_threshold(scores))
     calibration["source_split"] = "validation"
     write_json_atomic(path, calibration)
     return calibration

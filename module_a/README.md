@@ -233,27 +233,36 @@ most `max_sv_positive_per_speaker` deterministic positive trials. The protocol t
 samples an equal number of unique different-speaker negative pairs using seed 42.
 Cosine similarity is the dot product of normalized embeddings. EER is the average of
 FAR and FRR at the empirical score threshold minimizing `abs(FAR - FRR)`; it is not
-interpolated, and equal objectives prefer the higher threshold. That validation EER
-threshold is the frozen deployment SV threshold. Test EER and its threshold are
-descriptive only; test FAR/FRR use the persisted validation threshold.
+interpolated, and equal objectives prefer the higher threshold. EER and its threshold
+remain intrinsic model metrics. Separately, validation chooses the deployment SV
+threshold from empirical candidates (including a reject-all sentinel): among points
+with `FAR <= sv_target_far` (default 0.05), it minimizes FRR and then prefers the
+higher threshold. Future test FAR/FRR must use this persisted deployment threshold;
+test EER and its threshold remain descriptive only.
 
 Open-set SID is built independently inside each split. Seeded selection assigns 80%
 of speakers (round-half-up, with both sets kept non-empty) to known and the rest to
 unknown. Each known speaker contributes at most five deterministic enrollment
 utterances and retains at least one disjoint probe; unknown speakers contribute no
 enrollment and all their utterances are probes. Enrollment embeddings are averaged
-and L2-normalized into prototypes. SID calibration maximizes validation overall
-open-set accuracy, where known probes are correct only when accepted with the right
-identity and unknown probes are correct only when rejected. Ties prefer the higher,
-more conservative threshold.
+and L2-normalized into prototypes. Known top-1 identity accuracy remains a separate,
+threshold-independent intrinsic metric. SID deployment calibration maximizes
+`0.5 * known_accepted_correct_rate + 0.5 * unknown_rejection_rate`, giving the known
+and unknown probe classes equal aggregate weight even when their counts differ. Raw
+overall open-set accuracy is still reported but is not optimized. Ties prefer the
+higher, more conservative threshold.
 
 Validation and test speakers and paths are checked against each other and against the
 checkpoint's train-only `speaker_to_index`. Validation is the only phase that writes
 `calibration/sv_calibration.json` and `calibration/sid_calibration.json`. Test mode
 refuses to start without both persisted validation artifacts, reloads them before
-scoring, and never recalibrates or overwrites them. A1 validation/test remain the
-primary speaker-disjoint protocol; incomplete official Vietnam-Celeb E/H files are
-not used by this A4 implementation.
+scoring, and never recalibrates or overwrites them. Calibration artifacts bind the
+policy/schema version, checkpoint SHA256, validation manifest fingerprint, seed,
+protocol settings, and SV target FAR. A1 validation/test remain the primary
+speaker-disjoint protocol; incomplete official Vietnam-Celeb E/H files are not used
+by this A4 implementation. Threshold-policy changes do not invalidate compatible
+embedding caches because cache identity is bound separately to the model, manifest,
+preprocessing, and embedding configuration.
 
 Validation-only Kaggle command:
 
@@ -262,9 +271,14 @@ python -m module_a.scripts.evaluate_model \
   --phase validation \
   --dataset-root /kaggle/input/datasets/davidthomastran/vietnam-celeb-dataset/full-dataset/data \
   --val-manifest /kaggle/working/module_a_outputs/val_manifest.csv \
-  --checkpoint /kaggle/working/module_a-stage1-full/checkpoints/last.pt \
-  --output-dir /kaggle/working/module_a_a4 \
-  --device cuda
+  --checkpoint /kaggle/working/module_a-stage1-full-fixed/checkpoints/last.pt \
+  --output-dir /kaggle/working/module_a-a4-fixed \
+  --device cuda \
+  --seed 42 \
+  --max-sv-positive-per-speaker 20 \
+  --sid-known-ratio 0.8 \
+  --sid-max-enrollment 5 \
+  --sv-target-far 0.05
 ```
 
 Only after reviewing/fixing the validation protocol and freezing its two calibration

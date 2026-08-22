@@ -18,6 +18,10 @@ from module_a.src.evaluation import EvaluationError, write_json_atomic
 from module_a.src.training_data import TrainingRecord
 
 
+SV_CALIBRATION_SCHEMA_VERSION = 2
+SV_CALIBRATION_POLICY_VERSION = "sv_eer_and_target_far_empirical_v1"
+
+
 @dataclass(frozen=True)
 class SVTrial:
     path_a: str
@@ -263,15 +267,52 @@ def compute_sv_metrics(scores: Sequence[SVScore]) -> dict[str, Any]:
     }
 
 
-def calibrate_sv_threshold(scores: Sequence[SVScore]) -> dict[str, Any]:
+def select_sv_target_far_operating_point(
+    scores: Sequence[SVScore], target_far: float
+) -> dict[str, float]:
+    """Select the empirical target-FAR point without interpolation.
+
+    Candidates include one threshold strictly above the maximum observed score, so
+    FAR=0 is always feasible. Among points with FAR <= ``target_far``, the point
+    with the lowest FRR is selected; equal-FRR behavior prefers the higher threshold.
+    """
+
+    if not math.isfinite(target_far) or not 0.0 <= target_far <= 1.0:
+        raise EvaluationError("SV target FAR must be finite and between 0 and 1.")
+    candidates = [
+        {"threshold": threshold, **rates_at_threshold(scores, threshold)}
+        for threshold in _threshold_grid(scores)
+    ]
+    feasible = [point for point in candidates if point["far"] <= target_far]
+    if not feasible:  # Defensive: the above-maximum sentinel should make this impossible.
+        raise EvaluationError("No empirical SV threshold satisfies the target FAR.")
+    return min(feasible, key=lambda point: (point["frr"], -point["threshold"]))
+
+
+def calibrate_sv_threshold(
+    scores: Sequence[SVScore], *, target_far: float = 0.05
+) -> dict[str, Any]:
     metrics = compute_sv_metrics(scores)
+    deployment = select_sv_target_far_operating_point(scores, target_far)
     return {
+        "calibration_schema_version": SV_CALIBRATION_SCHEMA_VERSION,
+        "calibration_policy_version": SV_CALIBRATION_POLICY_VERSION,
         "source_split": "validation",
-        "objective": "minimize absolute FAR-FRR gap on empirical score thresholds",
-        "selected_threshold": metrics["eer_threshold"],
+        "intrinsic_policy": "empirical_eer",
         "validation_eer": metrics["eer"],
-        "far": metrics["far_at_eer_threshold"],
-        "frr": metrics["frr_at_eer_threshold"],
+        "eer_threshold": metrics["eer_threshold"],
+        "far_at_eer_threshold": metrics["far_at_eer_threshold"],
+        "frr_at_eer_threshold": metrics["frr_at_eer_threshold"],
+        "deployment_policy": "target_far",
+        "deployment_objective": (
+            "lowest empirical FRR subject to FAR <= target; higher-threshold tie-break"
+        ),
+        "deployment_target_far": float(target_far),
+        "deployment_threshold": float(deployment["threshold"]),
+        "deployment_far": float(deployment["far"]),
+        "deployment_frr": float(deployment["frr"]),
+        "deployment_tpr": float(deployment["tpr"]),
+        "deployment_tar": float(deployment["tpr"]),
         "positive_trials": metrics["positive_trials"],
         "negative_trials": metrics["negative_trials"],
         "positive_score_distribution": metrics["positive_score_distribution"],
@@ -287,10 +328,21 @@ def load_frozen_sv_calibration(
     from module_a.src.evaluation import read_json_object
 
     calibration = read_json_object(path)
-    threshold = calibration.get("selected_threshold")
-    if calibration.get("source_split") != "validation" or not isinstance(
-        threshold, (int, float)
-    ) or not math.isfinite(float(threshold)):
+    threshold = calibration.get("deployment_threshold")
+    target_far = calibration.get("deployment_target_far")
+    if (
+        calibration.get("calibration_schema_version")
+        != SV_CALIBRATION_SCHEMA_VERSION
+        or calibration.get("calibration_policy_version")
+        != SV_CALIBRATION_POLICY_VERSION
+        or calibration.get("source_split") != "validation"
+        or calibration.get("deployment_policy") != "target_far"
+        or not isinstance(threshold, (int, float))
+        or not math.isfinite(float(threshold))
+        or not isinstance(target_far, (int, float))
+        or not math.isfinite(float(target_far))
+        or not 0 <= float(target_far) <= 1
+    ):
         raise EvaluationError("SV calibration is not a frozen validation artifact.")
     for key, expected in (expected_provenance or {}).items():
         if calibration.get(key) != expected:
@@ -302,10 +354,11 @@ def write_sv_calibration(
     path: str | Path,
     scores: Sequence[SVScore],
     *,
+    target_far: float = 0.05,
     provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    calibration = calibrate_sv_threshold(scores)
-    calibration.update(dict(provenance or {}))
+    calibration = dict(provenance or {})
+    calibration.update(calibrate_sv_threshold(scores, target_far=target_far))
     calibration["source_split"] = "validation"
     write_json_atomic(path, calibration)
     return calibration

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -107,6 +108,7 @@ class EvaluationConfig:
     embedding_batch_size: int
     mixed_precision: bool
     max_sv_positive_per_speaker: int
+    sv_target_far: float
     sid_known_ratio: float
     sid_max_enrollment: int
 
@@ -507,6 +509,10 @@ def load_config(
                 evaluation_data.get("max_sv_positive_per_speaker"),
                 "evaluation.max_sv_positive_per_speaker",
             ),
+            sv_target_far=_non_negative_number(
+                evaluation_data.get("sv_target_far", 0.05),
+                "evaluation.sv_target_far",
+            ),
             sid_known_ratio=_ratio(
                 evaluation_data.get("sid_known_ratio"),
                 "evaluation.sid_known_ratio",
@@ -524,4 +530,9 @@ def load_config(
         raise ConfigurationError("A3 scheduler.type must be cosine.")
     if not 0 < config.evaluation.sid_known_ratio < 1:
         raise ConfigurationError("evaluation.sid_known_ratio must be between 0 and 1.")
+    if (
+        not math.isfinite(config.evaluation.sv_target_far)
+        or config.evaluation.sv_target_far > 1
+    ):
+        raise ConfigurationError("evaluation.sv_target_far must be between 0 and 1.")
     return config.with_overrides(dataset_root=dataset_root, output_root=output_root)

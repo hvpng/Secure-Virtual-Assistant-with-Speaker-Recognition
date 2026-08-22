@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 from module_a.src.sid_evaluation import (
@@ -81,6 +83,7 @@ def test_sid_metrics_and_rejection_are_exact_on_synthetic_scores():
     assert metrics["known_accepted_correct_rate"] == 0.5
     assert metrics["unknown_rejection_rate"] == 1.0
     assert metrics["unknown_false_accept_rate"] == 0.0
+    assert metrics["balanced_open_set_accuracy"] == 0.75
     assert metrics["overall_open_set_accuracy"] == 0.75
 
 
@@ -93,3 +96,40 @@ def test_sid_calibration_tie_prefers_higher_threshold():
     assert calibration["source_split"] == "validation"
     assert calibration["selected_threshold"] > 0.5
     assert calibration["tie_breaker"] == "higher threshold"
+
+
+def test_balanced_sid_calibration_differs_from_probe_count_weighted_raw_accuracy():
+    scores = [
+        SIDProbeScore(f"k{index}", "a", "known", "a", 0.9 if index < 10 else 0.6)
+        for index in range(100)
+    ] + [SIDProbeScore("u", "u", "unknown", "a", 0.65)]
+    permissive = sid_metrics_at_threshold(scores, 0.6)
+    calibration = calibrate_sid_threshold(scores)
+    assert permissive["overall_open_set_accuracy"] == 100 / 101
+    assert calibration["selected_threshold"] == 0.9
+    assert calibration["balanced_open_set_accuracy"] == 0.55
+    assert calibration["overall_open_set_accuracy"] < permissive["overall_open_set_accuracy"]
+    assert calibration["objective"] == "maximize validation balanced open-set accuracy"
+
+
+def test_balanced_sid_formula_and_boundary_operating_points():
+    scores = [
+        SIDProbeScore("k1", "a", "known", "a", 0.8),
+        SIDProbeScore("k2", "b", "known", "a", 0.7),
+        SIDProbeScore("u1", "u", "unknown", "a", 0.6),
+    ]
+    operating = sid_metrics_at_threshold(scores, 0.75)
+    assert operating["balanced_open_set_accuracy"] == (
+        0.5 * operating["known_accepted_correct_rate"]
+        + 0.5 * operating["unknown_rejection_rate"]
+    )
+    accept_all = sid_metrics_at_threshold(scores, 0.6)
+    reject_all = sid_metrics_at_threshold(scores, math.nextafter(0.8, math.inf))
+    assert accept_all["known_rejection_rate"] == 0.0
+    assert accept_all["unknown_rejection_rate"] == 0.0
+    assert reject_all["known_rejection_rate"] == 1.0
+    assert reject_all["unknown_rejection_rate"] == 1.0
+    assert (
+        accept_all["known_top1_identity_accuracy"]
+        == reject_all["known_top1_identity_accuracy"]
+    )

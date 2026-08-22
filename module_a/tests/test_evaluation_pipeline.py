@@ -1,15 +1,26 @@
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
-from module_a.scripts.evaluate_model import _validate_args, build_parser
+import module_a.scripts.evaluate_model as evaluate_script
+from module_a.scripts.evaluate_model import (
+    _load_phase_manifests,
+    _validate_args,
+    build_parser,
+)
 from module_a.src.evaluation import (
     EvaluationError,
     load_split_manifest,
     validate_evaluation_isolation,
 )
-from module_a.src.evaluation_pipeline import run_test_protocols, run_validation_protocols
+from module_a.src.evaluation_pipeline import (
+    require_frozen_calibrations,
+    run_test_protocols,
+    run_validation_protocols,
+)
 from module_a.src.sv_evaluation import build_sv_trials
 from module_a.src.training_data import TrainingRecord
 
@@ -69,8 +80,10 @@ def test_test_consumes_frozen_validation_thresholds_without_overwrite(tmp_path):
         sid_max_enrollment=2,
     )
     assert before == (sv_path.read_bytes(), sid_path.read_bytes())
-    assert test["sv"]["metrics"]["frozen_validation_sv_threshold"] == validation["sv"]["calibration"]["selected_threshold"]
+    assert test["sv"]["metrics"]["frozen_validation_sv_deployment_threshold"] == validation["sv"]["calibration"]["deployment_threshold"]
     assert test["sid"]["metrics"]["frozen_validation_sid_threshold"] == validation["sid"]["calibration"]["selected_threshold"]
+    assert validation["sv"]["metrics"]["eer_threshold"] == validation["sv"]["calibration"]["eer_threshold"]
+    assert validation["sv"]["metrics"]["deployment_target_far"] == 0.05
 
 
 def test_test_rejects_calibration_from_another_checkpoint(tmp_path):
@@ -97,6 +110,117 @@ def test_test_rejects_calibration_from_another_checkpoint(tmp_path):
             sid_max_enrollment=2,
             expected_calibration_provenance={"checkpoint_sha256": "checkpoint-b"},
         )
+
+
+def test_test_rejects_calibration_from_another_protocol(tmp_path):
+    val_records, val_embeddings = _data("val")
+    run_validation_protocols(
+        val_records,
+        val_embeddings,
+        output_dir=tmp_path,
+        seed=42,
+        max_sv_positive_per_speaker=2,
+        sid_known_ratio=0.8,
+        sid_max_enrollment=2,
+        calibration_provenance={"sid_known_ratio": 0.8},
+    )
+    test_records, test_embeddings = _data("test")
+    with pytest.raises(EvaluationError, match="provenance mismatch"):
+        run_test_protocols(
+            test_records,
+            test_embeddings,
+            output_dir=tmp_path,
+            seed=42,
+            max_sv_positive_per_speaker=2,
+            sid_known_ratio=0.8,
+            sid_max_enrollment=2,
+            expected_calibration_provenance={"sid_known_ratio": 0.7},
+        )
+
+
+def test_old_calibration_policy_is_rejected(tmp_path):
+    calibration_dir = tmp_path / "calibration"
+    calibration_dir.mkdir()
+    old = {"source_split": "validation", "selected_threshold": 0.5}
+    (calibration_dir / "sv_calibration.json").write_text(
+        json.dumps(old), encoding="utf-8"
+    )
+    (calibration_dir / "sid_calibration.json").write_text(
+        json.dumps(old), encoding="utf-8"
+    )
+    with pytest.raises(EvaluationError, match="frozen validation artifact"):
+        require_frozen_calibrations(tmp_path)
+
+
+def test_old_sid_raw_accuracy_policy_is_rejected(tmp_path):
+    val_records, val_embeddings = _data("val")
+    run_validation_protocols(
+        val_records,
+        val_embeddings,
+        output_dir=tmp_path,
+        seed=42,
+        max_sv_positive_per_speaker=2,
+        sid_known_ratio=0.8,
+        sid_max_enrollment=2,
+    )
+    sid_path = tmp_path / "calibration" / "sid_calibration.json"
+    sid = json.loads(sid_path.read_text(encoding="utf-8"))
+    sid["objective"] = "maximize validation overall open-set accuracy"
+    sid_path.write_text(json.dumps(sid), encoding="utf-8")
+    with pytest.raises(EvaluationError, match="frozen validation artifact"):
+        require_frozen_calibrations(tmp_path)
+
+
+def test_test_rejects_calibration_from_another_validation_manifest(tmp_path):
+    val_records, val_embeddings = _data("val")
+    run_validation_protocols(
+        val_records,
+        val_embeddings,
+        output_dir=tmp_path,
+        seed=42,
+        max_sv_positive_per_speaker=2,
+        sid_known_ratio=0.8,
+        sid_max_enrollment=2,
+        calibration_provenance={"validation_manifest_sha256": "manifest-a"},
+    )
+    test_records, test_embeddings = _data("test")
+    with pytest.raises(EvaluationError, match="provenance mismatch"):
+        run_test_protocols(
+            test_records,
+            test_embeddings,
+            output_dir=tmp_path,
+            seed=42,
+            max_sv_positive_per_speaker=2,
+            sid_known_ratio=0.8,
+            sid_max_enrollment=2,
+            expected_calibration_provenance={
+                "validation_manifest_sha256": "manifest-b"
+            },
+        )
+
+
+def test_validation_phase_does_not_load_test_manifest(monkeypatch):
+    args = build_parser().parse_args(
+        [
+            "--dataset-root", "dataset",
+            "--val-manifest", "val.csv",
+            "--test-manifest", "must-not-load.csv",
+            "--checkpoint", "last.pt",
+            "--output-dir", "a4",
+            "--phase", "validation",
+        ]
+    )
+    calls = []
+
+    def fake_load(path, split):
+        calls.append((path, split))
+        return []
+
+    monkeypatch.setattr(evaluate_script, "load_split_manifest", fake_load)
+    validation_records, test_records = _load_phase_manifests(args)
+    assert validation_records == []
+    assert test_records is None
+    assert calls == [("val.csv", "val")]
 
 
 def test_split_isolation_rejects_train_and_validation_test_leakage():

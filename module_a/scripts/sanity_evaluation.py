@@ -137,9 +137,10 @@ def main() -> int:
         report = {
             "device": "cpu",
             "validation_sv_eer": validation["sv"]["metrics"]["eer"],
-            "validation_sv_threshold": validation["sv"]["calibration"]["selected_threshold"],
+            "validation_sv_eer_threshold": validation["sv"]["calibration"]["eer_threshold"],
+            "validation_sv_deployment_threshold": validation["sv"]["calibration"]["deployment_threshold"],
             "validation_sid_threshold": validation["sid"]["calibration"]["selected_threshold"],
-            "test_sv_frozen_threshold": test["sv"]["metrics"]["frozen_validation_sv_threshold"],
+            "test_sv_frozen_threshold": test["sv"]["metrics"]["frozen_validation_sv_deployment_threshold"],
             "test_sid_frozen_threshold": test["sid"]["metrics"]["frozen_validation_sid_threshold"],
             "artifacts_verified": len(required),
             "status": "passed",

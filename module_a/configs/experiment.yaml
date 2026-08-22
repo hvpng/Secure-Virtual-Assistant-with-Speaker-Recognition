@@ -63,6 +63,8 @@ evaluation:
   mixed_precision: false
   embedding_batch_size: 8
   max_sv_positive_per_speaker: 20
+  # Deployment operating point; EER remains a separate intrinsic validation metric.
+  sv_target_far: 0.05
   sid_known_ratio: 0.8
   sid_max_enrollment: 5
 

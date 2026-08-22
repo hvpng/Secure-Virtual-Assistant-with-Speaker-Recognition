@@ -33,6 +33,9 @@ from module_a.src.sv_evaluation import (
 from module_a.src.training_data import TrainingRecord
 
 
+A4_CALIBRATION_CONTRACT_VERSION = "a4_validation_calibration_v2"
+
+
 def _paths(output_dir: str | Path, split: str) -> dict[str, Path]:
     root = Path(output_dir).expanduser().resolve()
     return {
@@ -74,6 +77,7 @@ def run_validation_protocols(
     max_sv_positive_per_speaker: int,
     sid_known_ratio: float,
     sid_max_enrollment: int,
+    sv_target_far: float = 0.05,
     calibration_provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Calibrate SV and SID exclusively from A1 validation speakers."""
@@ -91,10 +95,26 @@ def run_validation_protocols(
     sv_scores = score_sv_trials(sv_trials, embeddings)
     write_sv_scores(paths["sv_scores"], sv_scores)
     sv_metrics = compute_sv_metrics(sv_scores)
-    write_json_atomic(paths["sv_metrics"], sv_metrics)
     sv_calibration = write_sv_calibration(
-        paths["sv_calibration"], sv_scores, provenance=calibration_provenance
+        paths["sv_calibration"],
+        sv_scores,
+        target_far=sv_target_far,
+        provenance=calibration_provenance,
     )
+    sv_metrics.update(
+        {
+            "validation_eer": sv_metrics["eer"],
+            "intrinsic_threshold_policy": "empirical_eer",
+            "deployment_policy": sv_calibration["deployment_policy"],
+            "deployment_target_far": sv_calibration["deployment_target_far"],
+            "deployment_threshold": sv_calibration["deployment_threshold"],
+            "deployment_far": sv_calibration["deployment_far"],
+            "deployment_frr": sv_calibration["deployment_frr"],
+            "deployment_tpr": sv_calibration["deployment_tpr"],
+            "deployment_tar": sv_calibration["deployment_tar"],
+        }
+    )
+    write_json_atomic(paths["sv_metrics"], sv_metrics)
 
     sid_protocol = build_sid_protocol(
         records,
@@ -148,7 +168,7 @@ def run_test_protocols(
     sv_calibration, sid_calibration = require_frozen_calibrations(
         output_dir, expected_provenance=expected_calibration_provenance
     )
-    sv_threshold = float(sv_calibration["selected_threshold"])
+    sv_threshold = float(sv_calibration["deployment_threshold"])
     sid_threshold = float(sid_calibration["selected_threshold"])
     paths = _paths(output_dir, "test")
 
@@ -166,9 +186,11 @@ def run_test_protocols(
         "test_eer": descriptive["eer"],
         "test_eer_threshold": descriptive["eer_threshold"],
         "test_eer_threshold_policy": "descriptive_only_not_deployment",
-        "frozen_validation_sv_threshold": sv_threshold,
-        "test_far_at_frozen_threshold": frozen_rates["far"],
-        "test_frr_at_frozen_threshold": frozen_rates["frr"],
+        "frozen_validation_sv_deployment_threshold": sv_threshold,
+        "frozen_validation_sv_target_far": sv_calibration["deployment_target_far"],
+        "test_far_at_frozen_deployment_threshold": frozen_rates["far"],
+        "test_frr_at_frozen_deployment_threshold": frozen_rates["frr"],
+        "test_tpr_at_frozen_deployment_threshold": frozen_rates["tpr"],
         "auc": descriptive["auc"],
         "positive_trials": descriptive["positive_trials"],
         "negative_trials": descriptive["negative_trials"],
