@@ -46,8 +46,8 @@ training:
   num_workers: 2
   gradient_accumulation_steps: 1
   log_every_steps: 10
-  val_every_steps: 2171
-  save_every_steps: 2171
+  val_every_steps: 2167
+  save_every_steps: 2167
   max_train_speakers: null
   max_monitor_speakers: 100
   monitor_holdout_ratio: 0.1
