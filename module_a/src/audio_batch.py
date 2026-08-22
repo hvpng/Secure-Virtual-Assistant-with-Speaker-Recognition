@@ -21,11 +21,13 @@ def _load_pcm16_wav(path: Path) -> tuple[Tensor, int]:
     try:
         with wave.open(str(path), "rb") as audio:
             if audio.getcomptype() != "NONE" or audio.getsampwidth() != 2:
-                raise AudioBatchError("WAV must be uncompressed PCM16 for A2 loading.")
+                raise AudioBatchError(
+                    "Strict WAV fast path supports only uncompressed PCM16."
+                )
             channels = audio.getnchannels()
             sample_rate = audio.getframerate()
             frames = audio.readframes(audio.getnframes())
-    except (wave.Error, OSError) as exc:
+    except (EOFError, wave.Error, OSError) as exc:
         raise AudioBatchError(f"Cannot decode PCM16 WAV: {path}") from exc
     if channels <= 0 or sample_rate <= 0 or not frames:
         raise AudioBatchError("WAV header or audio payload is empty.")
@@ -36,29 +38,66 @@ def _load_pcm16_wav(path: Path) -> tuple[Tensor, int]:
     return waveform.mean(dim=1) / 32768.0, sample_rate
 
 
+def _load_with_torchaudio(path: Path) -> tuple[Tensor, int]:
+    """Decode normalized floating-point audio and average channels to mono."""
+
+    try:
+        decoded, sample_rate = torchaudio.load(str(path), normalize=True)
+    except Exception as exc:
+        raise AudioBatchError(f"torchaudio could not decode audio file: {path}") from exc
+    if (
+        decoded.ndim != 2
+        or decoded.shape[0] < 1
+        or decoded.shape[1] < 1
+        or sample_rate <= 0
+    ):
+        raise AudioBatchError(
+            f"Decoded audio must have shape [channels, samples] and a valid sample rate: {path}"
+        )
+    return decoded.to(torch.float32).mean(dim=0), int(sample_rate)
+
+
 def load_waveform(audio_path: str | Path, *, target_sample_rate: int = 16_000) -> Tensor:
-    """Load, average channels to mono, resample, and return a finite float32 vector."""
+    """Load training audio as finite mono float32 at ``target_sample_rate``.
+
+    Ordinary uncompressed PCM16 WAV files use the stdlib fast path, whose
+    division by 32768 matches ``torchaudio.load(normalize=True)`` amplitude
+    scaling. A WAV unsupported by that strict path (including valid PCM24) is
+    decoded by torchaudio instead. This policy is scoped to Module A ingestion;
+    it does not alter Track B's canonical PCM16 enrollment audio contract.
+    """
 
     path = Path(audio_path)
     if not path.is_file():
         raise AudioBatchError(f"Audio file does not exist: {path}")
+    if target_sample_rate <= 0:
+        raise AudioBatchError("target_sample_rate must be positive.")
     if path.suffix.lower() == ".wav":
-        waveform, sample_rate = _load_pcm16_wav(path)
-    else:
         try:
-            decoded, sample_rate = torchaudio.load(str(path))
-        except Exception as exc:
-            raise AudioBatchError(f"Cannot decode audio file: {path}") from exc
-        if decoded.ndim != 2 or decoded.shape[0] < 1 or decoded.shape[1] < 1:
-            raise AudioBatchError("Decoded audio must have shape [channels, samples].")
-        waveform = decoded.to(torch.float32).mean(dim=0)
+            waveform, sample_rate = _load_pcm16_wav(path)
+        except AudioBatchError as strict_error:
+            try:
+                waveform, sample_rate = _load_with_torchaudio(path)
+            except AudioBatchError as fallback_error:
+                raise AudioBatchError(
+                    f"Cannot decode WAV file {path}. "
+                    f"Strict PCM16 decoder failed: {strict_error} "
+                    f"Torchaudio fallback failed: {fallback_error}"
+                ) from fallback_error
+    else:
+        waveform, sample_rate = _load_with_torchaudio(path)
     if sample_rate != target_sample_rate:
         waveform = torchaudio.functional.resample(
             waveform,
             orig_freq=sample_rate,
             new_freq=target_sample_rate,
         )
-    if waveform.numel() == 0 or not torch.isfinite(waveform).all():
+    waveform = waveform.to(torch.float32)
+    if (
+        waveform.ndim != 1
+        or waveform.numel() == 0
+        or not torch.isfinite(waveform).all()
+    ):
         raise AudioBatchError("Decoded waveform is empty or non-finite.")
     return waveform.contiguous()
 

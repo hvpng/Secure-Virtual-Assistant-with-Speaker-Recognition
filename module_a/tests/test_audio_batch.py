@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import wave
+from array import array
 from pathlib import Path
 
 import pytest
 import torch
 
+from module_a.src import audio_batch
 from module_a.src.audio_batch import (
     AudioBatchError,
     collate_fixed_waveforms,
@@ -16,20 +19,98 @@ from module_a.src.audio_batch import (
 )
 
 
-def test_audio_loader_returns_mono_16k_float32(tmp_path, write_wav):
-    path = write_wav(
-        tmp_path / "stereo.wav",
-        sample_rate=8_000,
-        duration_sec=0.1,
-        channels=2,
+def _write_pcm24_wav(path: Path, samples: list[int], *, sample_rate: int = 16_000) -> Path:
+    payload = bytearray()
+    for sample in samples:
+        encoded = sample if sample >= 0 else (1 << 24) + sample
+        payload.extend(
+            (encoded & 0xFF, (encoded >> 8) & 0xFF, (encoded >> 16) & 0xFF)
+        )
+    with wave.open(str(path), "wb") as stream:
+        stream.setnchannels(1)
+        stream.setsampwidth(3)
+        stream.setframerate(sample_rate)
+        stream.writeframes(bytes(payload))
+    return path
+
+
+def test_audio_loader_uses_pcm16_fast_path(tmp_path, write_wav, monkeypatch):
+    path = write_wav(tmp_path / "pcm16.wav", sample_rate=16_000, duration_sec=0.1)
+
+    def unexpected_fallback(*_args, **_kwargs):
+        raise AssertionError("PCM16 WAV unexpectedly used the torchaudio fallback")
+
+    def unexpected_resample(*_args, **_kwargs):
+        raise AssertionError("16 kHz WAV unexpectedly entered the resampler")
+
+    monkeypatch.setattr(audio_batch.torchaudio, "load", unexpected_fallback)
+    monkeypatch.setattr(
+        audio_batch.torchaudio.functional, "resample", unexpected_resample
     )
 
     waveform = load_waveform(path, target_sample_rate=16_000)
 
     assert waveform.ndim == 1
     assert waveform.dtype == torch.float32
-    assert waveform.numel() == pytest.approx(1_600, abs=2)
+    assert waveform.numel() == 1_600
     assert torch.isfinite(waveform).all()
+
+
+def test_audio_loader_falls_back_for_normalized_pcm24(tmp_path):
+    samples = [0, 1 << 22, -(1 << 22), (1 << 23) - 1, -(1 << 23)]
+    path = _write_pcm24_wav(tmp_path / "pcm24.wav", samples)
+
+    waveform = load_waveform(path)
+
+    expected = torch.tensor(samples, dtype=torch.float32) / float(1 << 23)
+    assert waveform.ndim == 1
+    assert waveform.dtype == torch.float32
+    assert torch.isfinite(waveform).all()
+    assert torch.allclose(waveform, expected, atol=1e-6, rtol=0)
+
+
+def test_audio_loader_averages_stereo_channels_to_mono(tmp_path):
+    path = tmp_path / "stereo.wav"
+    stereo_samples = array("h", [16_384, -16_384, 8_192, 0])
+    with wave.open(str(path), "wb") as stream:
+        stream.setnchannels(2)
+        stream.setsampwidth(2)
+        stream.setframerate(16_000)
+        stream.writeframes(stereo_samples.tobytes())
+
+    waveform = load_waveform(path)
+
+    assert torch.allclose(waveform, torch.tensor([0.0, 0.125]), atol=1e-7, rtol=0)
+
+
+def test_audio_loader_resamples_only_when_needed(tmp_path, write_wav, monkeypatch):
+    path = write_wav(tmp_path / "pcm16_8k.wav", sample_rate=8_000, duration_sec=0.1)
+    calls: list[tuple[int, int]] = []
+    resample = audio_batch.torchaudio.functional.resample
+
+    def tracked_resample(waveform, *, orig_freq, new_freq):
+        calls.append((orig_freq, new_freq))
+        return resample(waveform, orig_freq=orig_freq, new_freq=new_freq)
+
+    monkeypatch.setattr(audio_batch.torchaudio.functional, "resample", tracked_resample)
+
+    waveform = load_waveform(path, target_sample_rate=16_000)
+
+    assert calls == [(8_000, 16_000)]
+    assert waveform.numel() == pytest.approx(1_600, abs=2)
+    assert waveform.dtype == torch.float32
+    assert torch.isfinite(waveform).all()
+
+
+def test_audio_loader_reports_path_when_wav_is_corrupt(tmp_path):
+    path = tmp_path / "corrupt.wav"
+    path.write_bytes(b"not a wav")
+
+    with pytest.raises(AudioBatchError) as error:
+        load_waveform(path)
+
+    assert "Cannot decode WAV file" in str(error.value)
+    assert str(path) in str(error.value)
 
 
 def test_fixed_collator_center_crops_and_repeat_pads_deterministically():
